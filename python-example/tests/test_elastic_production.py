@@ -69,7 +69,7 @@ def deadline():
 def test_append_happens_before_next_source_read():
     channel = Channel()
 
-    class Source(support.ReplaySource):
+    class Source(support.SampleEventSource):
         def read(self):
             assert len(channel.calls) == self.next_offset - 1
             return super().read()
@@ -83,7 +83,7 @@ def test_append_happens_before_next_source_read():
 
 def test_checkpoint_pauses_source_reads_until_every_ack(monkeypatch):
     monkeypatch.setattr(support, "CHECKPOINT_ROWS", 2)
-    source = support.ReplaySource(3)
+    source = support.SampleEventSource(3)
 
     class Delayed(Future):
         def result(self, timeout=None):
@@ -112,7 +112,7 @@ def test_late_ack_keeps_original_future_and_client():
     future = Late()
     channel = Channel([future])
     session, clients = session_for(channel)
-    source = support.ReplaySource(1)
+    source = support.SampleEventSource(1)
     pending = [elastic.append_event(session, source.read(), deadline())]
     elastic.confirm_checkpoint(session, pending, source, deadline())
     assert future.polls == 2
@@ -124,7 +124,7 @@ def test_late_ack_keeps_original_future_and_client():
 
 def test_outage_deadline_preserves_source_checkpoint():
     session, _ = session_for(Channel())
-    source = support.ReplaySource(1)
+    source = support.SampleEventSource(1)
     pending = [elastic.Pending(source.read(), Future(), session.generation)]
     with pytest.raises(TimeoutError, match="retain events"):
         elastic.confirm_checkpoint(session, pending, source, support.time.monotonic() - 1)
@@ -138,7 +138,7 @@ def test_429_midstream_retries_only_rejected_event():
     first = completed()
     channel = Channel([first, pressure, completed()])
     session, clients = session_for(channel)
-    source = support.ReplaySource(2)
+    source = support.SampleEventSource(2)
     elastic.run(session, source)
     assert channel.calls == ["1", "2", "2"]
     assert source.committed == 2
@@ -149,7 +149,7 @@ def test_stale_invalidations_rebuild_only_once_and_skip_acked_rows():
     old = Channel([completed(), completed(failure()), completed(failure())])
     fresh = Channel()
     session, clients = session_for(old, fresh)
-    source = support.ReplaySource(3)
+    source = support.SampleEventSource(3)
     pending = [elastic.append_event(session, source.read(), deadline()) for _ in range(3)]
     elastic.confirm_checkpoint(session, pending, source, deadline())
     assert fresh.calls == ["2", "3"]
@@ -163,7 +163,7 @@ def test_permanent_failure_never_advances_source(status):
     error = failure(StreamingIngestErrorCode.SF_API_USER_ERROR, status)
     channel = Channel([completed(error)])
     session, _ = session_for(channel)
-    source = support.ReplaySource(3)
+    source = support.SampleEventSource(3)
     with pytest.raises(StreamingIngestError):
         elastic.run(session, source)
     assert source.committed == 0
@@ -174,7 +174,7 @@ def test_retry_exhaustion_does_not_ack_source():
     error = failure(StreamingIngestErrorCode.NON_FATAL, 503)
     channel = Channel([completed(error) for _ in range(support.MAX_ATTEMPTS)])
     session, _ = session_for(channel)
-    source = support.ReplaySource(1)
+    source = support.SampleEventSource(1)
     with pytest.raises(StreamingIngestError):
         elastic.run(session, source)
     assert source.committed == 0
@@ -182,7 +182,7 @@ def test_retry_exhaustion_does_not_ack_source():
 
 
 def test_out_of_order_completion_does_not_commit_a_gap():
-    source = support.ReplaySource(2)
+    source = support.SampleEventSource(2)
     future = Future()
     later = completed()
     session, _ = session_for(Channel())
@@ -196,9 +196,9 @@ def test_out_of_order_completion_does_not_commit_a_gap():
 
 
 def test_source_replay_is_deterministic_and_checkpoint_is_explicit():
-    first = support.ReplaySource(3)
+    first = support.SampleEventSource(3)
     events = [first.read() for _ in range(3)]
-    restarted = support.ReplaySource(3, checkpoint=1)
+    restarted = support.SampleEventSource(3, checkpoint=1)
     assert restarted.read() == events[1]
     assert restarted.committed == 1
 

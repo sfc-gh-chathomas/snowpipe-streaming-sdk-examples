@@ -31,7 +31,7 @@ test("Elastic appends before reading the next retained event", async () => {
   const client = elasticClient();
   const session = new elastic.ElasticProducer(async () => client);
   await session.open();
-  class Source extends support.ReplaySource {
+  class Source extends support.SampleEventSource {
     read() {
       assert.equal(client.calls.length, this.nextOffset - 1);
       return super.read();
@@ -49,7 +49,7 @@ test("caller polling timeout retains original promise; late success advances che
   const client = elasticClient([original]);
   const session = new elastic.ElasticProducer(async () => client);
   await session.open();
-  const source = new support.ReplaySource(1);
+  const source = new support.SampleEventSource(1);
   const pending = [elastic.appendEvent(session, source.read())];
   const waiting = await support.poll(pending[0].outcome, 1);
   assert.equal(waiting.waiting, true);
@@ -66,7 +66,7 @@ test("out-of-order success cannot acknowledge an earlier gap", async () => {
   const client = elasticClient([new Promise(() => {}), Promise.resolve()]);
   const session = new elastic.ElasticProducer(async () => client);
   await session.open();
-  const source = new support.ReplaySource(2);
+  const source = new support.SampleEventSource(2);
   const pending = [elastic.appendEvent(session, source.read()), elastic.appendEvent(session, source.read())];
   await assert.rejects(elastic.confirmCheckpoint(session, pending, source, performance.now() + 5), /Outage/);
   assert.equal(source.committed, 0);
@@ -82,7 +82,7 @@ test("checkpoint count bounds source intake", async (context) => {
   const client = elasticClient([blocked]);
   const session = new elastic.ElasticProducer(async () => client);
   await session.open();
-  const source = new support.ReplaySource(limit + 1);
+  const source = new support.SampleEventSource(limit + 1);
   const running = elastic.run(session, source);
   await new Promise((done) => setTimeout(done, 10));
   assert.equal(client.calls.length, limit);
@@ -98,7 +98,7 @@ test("429 retries the rejected event on the same client", async (context) => {
   const client = elasticClient([error("ReceiverSaturated", 429)]);
   const session = new elastic.ElasticProducer(async () => client);
   await session.open();
-  const source = new support.ReplaySource(1);
+  const source = new support.SampleEventSource(1);
   await elastic.run(session, source);
   assert.deepEqual(client.calls, ["1", "1"]);
   assert.deepEqual(client.closes, []);
@@ -112,7 +112,7 @@ test("SDK invalidation rebuilds once for a failed generation and skips successfu
   const clients = [old, fresh];
   const session = new elastic.ElasticProducer(async () => clients.shift());
   await session.open();
-  const source = new support.ReplaySource(3);
+  const source = new support.SampleEventSource(3);
   const pending = Array.from({ length: 3 }, () => elastic.appendEvent(session, source.read()));
   await elastic.confirmCheckpoint(session, pending, source, deadline());
   assert.deepEqual(fresh.calls, ["2", "3"]);
@@ -126,7 +126,7 @@ for (const status of [400, 401, 403, 404]) {
     const client = elasticClient([error("SfApiUserError", status)]);
     const session = new elastic.ElasticProducer(async () => client);
     await session.open();
-    const source = new support.ReplaySource(1);
+    const source = new support.SampleEventSource(1);
     await assert.rejects(elastic.run(session, source), (failure) => failure.httpStatusCode === status);
     assert.equal(source.committed, 0);
     assert.deepEqual(client.calls, ["1"]);
@@ -138,7 +138,7 @@ test("terminal SDK retry exhaustion stops with uncommitted source work", async (
   const client = elasticClient(Array.from({ length: support.MAX_ATTEMPTS }, () => error("HttpRetriesExhaustedError", 503)));
   const session = new elastic.ElasticProducer(async () => client);
   await session.open();
-  const source = new support.ReplaySource(1);
+  const source = new support.SampleEventSource(1);
   await assert.rejects(elastic.run(session, source));
   assert.equal(client.calls.length, support.MAX_ATTEMPTS);
   assert.equal(source.committed, 0);
@@ -165,7 +165,7 @@ function namedSession(committed = 0) {
 
 test("named restart seeks strictly after server committed offset", async () => {
   const session = namedSession(2);
-  const source = new support.ReplaySource(5);
+  const source = new support.SampleEventSource(5);
   await named.run(session, source);
   assert.deepEqual(session.calls, [3, 4, 5]);
   assert.equal(session.polls, 1);
@@ -175,7 +175,7 @@ test("named restart seeks strictly after server committed offset", async () => {
 test("named backpressure retains current event", async (context) => {
   context.mock.method(Math, "random", () => 0);
   const session = namedSession();
-  const source = new support.ReplaySource(3);
+  const source = new support.SampleEventSource(3);
   session.onAppend = (offset) => {
     assert.equal(source.nextOffset, offset + 1);
     session.onAppend = null;
@@ -195,7 +195,7 @@ test("named invalidation resumes from server offset without resetting it", async
       throw error("InvalidChannelError", 409);
     }
   };
-  const source = new support.ReplaySource(4);
+  const source = new support.SampleEventSource(4);
   await named.run(session, source);
   assert.deepEqual(session.calls, [1, 2, 3, 3, 4]);
   assert.equal(session.recoveries, 1);
@@ -205,7 +205,7 @@ test("named invalidation resumes from server offset without resetting it", async
 test("named delayed status keeps intake paused without reopening", async (context) => {
   context.mock.method(Math, "random", () => 0);
   const session = namedSession();
-  const source = new support.ReplaySource(2);
+  const source = new support.SampleEventSource(2);
   let polls = 0;
   session.channel.getChannelStatus = async () => {
     assert.equal(source.committed, 0);
@@ -225,7 +225,7 @@ test("named closed channel recovers from committed offset", async (context) => {
     session.onAppend = null;
     throw error("ClosedChannelError", 409);
   };
-  const source = new support.ReplaySource(2);
+  const source = new support.SampleEventSource(2);
   await named.run(session, source);
   assert.deepEqual(session.calls, [1, 1, 2]);
   assert.equal(session.recoveries, 1);
@@ -235,16 +235,16 @@ test("named closed channel recovers from committed offset", async (context) => {
 test("named row errors and permanent failures prevent handoff", async () => {
   const session = namedSession();
   session.channel.getChannelStatus = async () => ({ statusCode: "SUCCESS", rowsErrorCount: 1, latestCommittedOffsetToken: "2" });
-  const source = new support.ReplaySource(2);
+  const source = new support.SampleEventSource(2);
   await assert.rejects(named.run(session, source), /row errors/);
   assert.equal(source.committed, 0);
 });
 
 test("replay source regenerates stable payload and source checkpoint is explicit", () => {
-  const source = new support.ReplaySource(3);
+  const source = new support.SampleEventSource(3);
   source.read();
   const event = source.read();
-  assert.deepEqual(new support.ReplaySource(3, 1).read(), event);
+  assert.deepEqual(new support.SampleEventSource(3, 1).read(), event);
   assert.equal(source.committed, 0);
 });
 

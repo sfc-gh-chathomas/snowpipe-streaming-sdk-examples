@@ -30,6 +30,44 @@ public class ElasticProducer {
     static final long OUTAGE_NANOS = TimeUnit.MINUTES.toNanos(5);
     static final int MAX_ATTEMPTS = 6;
 
+    // Start here: create a source, connect, and stream retained events.
+    public static void main(String[] args) throws Exception {
+        SampleEventSource source = new SampleEventSource(
+                Long.parseLong(env("SNOWFLAKE_TEST_ROWS", "10000")),
+                Long.parseLong(env("SNOWFLAKE_SOURCE_CHECKPOINT", "0")));
+        Producer producer = new Producer(ElasticProducer::createClient);
+        boolean completed = false;
+        try {
+            producer.open();
+            run(producer, source);
+            completed = true;
+            System.out.println("Durable source checkpoint: " + source.committed + "; materialization is separate");
+        } finally {
+            if (!completed) System.err.println("Retain source events after checkpoint " + source.committed);
+            producer.close(completed);
+        }
+    }
+
+    static void run(Producer producer, SampleEventSource source) throws Exception {
+        List<Pending> pending = new ArrayList<>();
+        long checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
+        long deadline = System.nanoTime() + OUTAGE_NANOS;
+        Event event;
+        while ((event = source.read()) != null) {
+            pending.add(appendEvent(producer, event, deadline));
+            if (pending.stream().anyMatch(item -> item.future.isCompletedExceptionally())
+                    || pending.size() >= CHECKPOINT_ROWS || System.nanoTime() >= checkpointAt) {
+                confirmCheckpoint(producer, pending, source, deadline);
+                checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
+                deadline = System.nanoTime() + OUTAGE_NANOS;
+            }
+        }
+        confirmCheckpoint(producer, pending, source, deadline);
+    }
+
+
+
+    // Supporting delivery and connection details.
     static boolean invalidation(SFException error) {
         String code = error.getErrorCodeName();
         return "InvalidChannelError".equals(code) || "InvalidClientError".equals(code)
@@ -94,16 +132,17 @@ public class ElasticProducer {
         final Map<String, Object> row;
         Event(long offset) {
             this.offset = offset;
+            // Replace this mapping with your table columns and stable event ID.
             this.row = Map.of("EVENT_ID", offset, "C1", offset, "C2", "event-" + offset);
         }
     }
 
-    /** Deterministic replay fixture; its source checkpoint is not persisted. */
-    static class ReplaySource {
+    /** Synthetic input only. Replace read/acknowledge/seek with retained source operations. */
+    static class SampleEventSource {
         final long total;
         long committed;
         long nextOffset;
-        ReplaySource(long total, long checkpoint) {
+        SampleEventSource(long total, long checkpoint) {
             if (checkpoint < 0 || checkpoint > total) throw new IllegalArgumentException("Invalid checkpoint");
             this.total = total;
             this.committed = checkpoint;
@@ -111,6 +150,7 @@ public class ElasticProducer {
         }
         Event read() { return nextOffset > total ? null : new Event(nextOffset++); }
         void acknowledge(long offset) {
+            // Persist source progress before retiring real source events.
             if (offset < committed || offset > total) throw new IllegalArgumentException("Invalid checkpoint");
             committed = offset;
         }
@@ -171,6 +211,7 @@ public class ElasticProducer {
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
             remaining(deadline);
             try {
+                // This SDK call writes the row; preserve the returned Future.
                 return new Pending(event, producer.channel.appendRowWithWait(event.row, String.valueOf(event.offset)),
                         producer.generation);
             } catch (SFException error) {
@@ -182,7 +223,7 @@ public class ElasticProducer {
         throw new IllegalStateException("Submission retry budget exhausted");
     }
 
-    static void confirmCheckpoint(Producer producer, List<Pending> pending, ReplaySource source,
+    static void confirmCheckpoint(Producer producer, List<Pending> pending, SampleEventSource source,
                            long deadline) throws Exception {
         for (Pending original : pending) {
             Pending item = original;
@@ -213,37 +254,5 @@ public class ElasticProducer {
         }
     }
 
-    static void run(Producer producer, ReplaySource source) throws Exception {
-        List<Pending> pending = new ArrayList<>();
-        long checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
-        long deadline = System.nanoTime() + OUTAGE_NANOS;
-        Event event;
-        while ((event = source.read()) != null) {
-            pending.add(appendEvent(producer, event, deadline));
-            if (pending.stream().anyMatch(item -> item.future.isCompletedExceptionally())
-                    || pending.size() >= CHECKPOINT_ROWS || System.nanoTime() >= checkpointAt) {
-                confirmCheckpoint(producer, pending, source, deadline);
-                checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
-                deadline = System.nanoTime() + OUTAGE_NANOS;
-            }
-        }
-        confirmCheckpoint(producer, pending, source, deadline);
-    }
 
-    public static void main(String[] args) throws Exception {
-        ReplaySource source = new ReplaySource(
-                Long.parseLong(env("SNOWFLAKE_TEST_ROWS", "10000")),
-                Long.parseLong(env("SNOWFLAKE_SOURCE_CHECKPOINT", "0")));
-        Producer producer = new Producer(ElasticProducer::createClient);
-        boolean completed = false;
-        try {
-            producer.open();
-            run(producer, source);
-            completed = true;
-            System.out.println("Durable source checkpoint: " + source.committed + "; materialization is separate");
-        } finally {
-            if (!completed) System.err.println("Retain source events after checkpoint " + source.committed);
-            producer.close(completed);
-        }
-    }
 }

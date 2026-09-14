@@ -24,6 +24,48 @@ INVALIDATION = {"InvalidChannelError", "InvalidClientError", "ClosedChannelError
 TRANSIENT = {408, 429, 500, 502, 503, 504}
 
 
+# Start here: create a source, connect, and stream retained events.
+
+def main():
+    source = SampleEventSource(
+        int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000")),
+        int(os.environ.get("SNOWFLAKE_SOURCE_CHECKPOINT", "0")),
+    )
+    producer = ElasticProducer()
+    completed = False
+    try:
+        producer.open()
+        run(producer, source)
+        completed = True
+        print(f"Durable source checkpoint: {source.committed}; materialization is separate")
+    finally:
+        if not completed:
+            print(f"Stopped. Retain source events after checkpoint {source.committed} for replay")
+        producer.close(completed)
+
+
+
+def run(producer, source):
+    pending = []
+    checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
+    deadline = time.monotonic() + OUTAGE_SECONDS
+    while True:
+        # Read only while the previous checkpoint has capacity.
+        event = source.read()
+        if event is None:
+            # None means end-of-input, not a temporarily idle live source.
+            break
+        pending.append(append_event(producer, event, deadline))
+        failed = any(item.future.done() and item.future.exception() is not None for item in pending)
+        if failed or len(pending) >= CHECKPOINT_ROWS or time.monotonic() >= checkpoint_at:
+            confirm_checkpoint(producer, pending, source, deadline)
+            checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
+            deadline = time.monotonic() + OUTAGE_SECONDS
+    confirm_checkpoint(producer, pending, source, deadline)
+
+
+# Supporting delivery and connection details.
+
 def retryable(error):
     return isinstance(error, StreamingIngestError) and (
         error.error_code.value in INVALIDATION or error.http_status_code in TRANSIENT
@@ -63,8 +105,11 @@ def create_client():
     )
 
 
-class ReplaySource:
-    """Regenerates fixed events after restart; acknowledgement is only in-memory."""
+class SampleEventSource:
+    """Synthetic input only: no external source and no persisted checkpoint.
+
+    Replace read/acknowledge/seek with your retained source operations.
+    """
 
     def __init__(self, total=10_000, checkpoint=0):
         if not 0 <= checkpoint <= total:
@@ -79,14 +124,18 @@ class ReplaySource:
             return None
         offset = self.next_offset
         self.next_offset += 1
-        return offset, {"EVENT_ID": offset, "C1": offset, "C2": f"event-{offset}"}
+        # Replace this mapping with your target table columns and stable event ID.
+        row = {"EVENT_ID": offset, "C1": offset, "C2": f"event-{offset}"}
+        return offset, row
 
     def acknowledge(self, offset):
+        # In production, persist/commit source progress here before retiring events.
         if not self.committed <= offset <= self.total:
             raise ValueError("Invalid source checkpoint")
         self.committed = offset
 
     def seek(self, committed):
+        # Position the retained source strictly after Snowflake committed progress.
         self.acknowledge(committed)
         self.next_offset = committed + 1
 
@@ -99,7 +148,7 @@ class Pending:
 
 
 class ElasticProducer:
-    """Owns the current SDK client; old retry_attempts must not replace a fresh client."""
+    """Owns the current SDK client; old failures must not replace a fresh client."""
     def __init__(self, factory=create_client):
         self.factory = factory
         self.client = None
@@ -134,7 +183,9 @@ def append_event(producer, event, deadline):
     for attempt in range(MAX_ATTEMPTS):
         remaining(deadline)
         try:
-            return Pending(event, producer.channel.append_row_with_wait(event[1], str(event[0])),
+            source_offset, row = event
+            # This SDK call writes the event; the Future confirms durable acceptance.
+            return Pending(event, producer.channel.append_row_with_wait(row, str(source_offset)),
                            producer.generation)
         except StreamingIngestError as error:
             if not retryable(error) or attempt == MAX_ATTEMPTS - 1:
@@ -170,42 +221,6 @@ def confirm_checkpoint(producer, pending, source, deadline):
         # Every original append succeeded; the source may now retire this window.
         source.acknowledge(pending[-1].event[0])
         pending.clear()
-
-
-def run(producer, source):
-    pending = []
-    checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
-    deadline = time.monotonic() + OUTAGE_SECONDS
-    while True:
-        # Read only while the previous checkpoint has capacity.
-        event = source.read()
-        if event is None:
-            break
-        pending.append(append_event(producer, event, deadline))
-        failed = any(item.future.done() and item.future.exception() is not None for item in pending)
-        if failed or len(pending) >= CHECKPOINT_ROWS or time.monotonic() >= checkpoint_at:
-            confirm_checkpoint(producer, pending, source, deadline)
-            checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
-            deadline = time.monotonic() + OUTAGE_SECONDS
-    confirm_checkpoint(producer, pending, source, deadline)
-
-
-def main():
-    source = ReplaySource(
-        int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000")),
-        int(os.environ.get("SNOWFLAKE_SOURCE_CHECKPOINT", "0")),
-    )
-    producer = ElasticProducer()
-    completed = False
-    try:
-        producer.open()
-        run(producer, source)
-        completed = True
-        print(f"Durable source checkpoint: {source.committed}; materialization is separate")
-    finally:
-        if not completed:
-            print(f"Stopped. Retain source events after checkpoint {source.committed} for replay")
-        producer.close(completed)
 
 
 if __name__ == "__main__":

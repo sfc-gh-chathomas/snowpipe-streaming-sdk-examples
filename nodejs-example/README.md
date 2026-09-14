@@ -4,6 +4,25 @@ Examples for streaming data into Snowflake with the [Snowpipe Streaming SDK](htt
 
 Requires **snowpipe-streaming >= 1.8.0** and Node.js >= 20.
 
+
+## Adapt This Example to Your Application
+
+1. **Run the sample unchanged first.** Set your target database/schema/table and authentication profile. The production examples generate synthetic rows with `EVENT_ID NUMBER`, `C1 NUMBER`, and `C2 VARCHAR`; they do not read a broker, file, or API. Set `SNOWFLAKE_TEST_ROWS=1005` to exercise a full checkpoint and a final partial window. Successful output reports source checkpoint `1005`.
+2. **Start reading at `main`, then `run`.** The loop reads a retained event, submits it to the SDK, pauses at a checkpoint, and confirms progress before acknowledging the source. Connection and recovery details appear below that flow in the same file.
+3. **Replace `SampleEventSource`.** Replace `read` with your source operation and change the sample row mapping to match your table. Reading must not delete or permanently acknowledge an event. End-of-input (`None`/`null`) stops the example; a temporarily idle live source must instead wait or poll with a bounded, interruptible read.
+4. **Implement durable source progress.** Replace `acknowledge` with your source commit/checkpoint operation. The sample stores progress only in memory. Elastic requires retained/replayable events and stable source-unique IDs for duplicate reconciliation. Named channels additionally require `seek` strictly after the server's committed offset and one exclusive owner per stable channel name.
+5. **Choose outage and shutdown behavior.** Pausing reads must propagate backpressure to the producer. A push source needs explicit flow control. If events cannot be replayed, persist them before accepting responsibility; the SDK memory buffer is not a disk spool. On shutdown, stop intake and confirm pending progress within your budget; retain anything unconfirmed for restart.
+6. **Verify delivery and table results separately.** Elastic acknowledgement confirms durability, not row validity or immediate query visibility. Monitor materialization/error logging separately. Named examples block source handoff on row errors. Do not simply retry schema or authorization failures indefinitely.
+
+### Before Production
+
+- Size checkpoints for your payloads: an event-count limit is not a byte-memory limit. Validate row sizes and account for the SDK buffer plus retained source data.
+- The five-second checkpoint check runs between source reads, not on an independent timer. Integrate bounded reads and cancellation for live sources.
+- The five-minute checkpoint budget does not cancel SDK management calls or their independent transport retries.
+- Test restart, source checkpoint failure, invalidation, and sustained backpressure with your real source. Define storage capacity and overflow behavior before accepting unreplayable events.
+- Keep credentials in a secure credential manager and choose a role with only the required privileges. Kafka is not required solely to deliver events to Snowflake.
+
+
 ## Channel modes
 
 | Mode | File | When to use |
@@ -105,7 +124,7 @@ cannot cause an unhandled rejection. Count/time checkpoints pause intake and wai
 Promise. A caller timeout neither cancels nor resubmits it. Only terminal retryable SDK failures are
 resubmitted; only SDK invalidation recreates the client. Old-generation failures reuse the new client.
 
-Both production programs are self-contained. The included `ReplaySource` regenerates fixed
+Both production programs are self-contained. The included `SampleEventSource` regenerates fixed
 events and does not persist checkpoints. Replace it with the producer's retained source API.
 PAT mode requires `SNOWFLAKE_PAT`, `SNOWFLAKE_ACCOUNT`, and `SNOWFLAKE_URL`; `SNOWFLAKE_ROLE` is optional.
 Otherwise `profile.json` or `SNOWFLAKE_PROFILE` is used. Account/role defaults are not hard-coded for tests.

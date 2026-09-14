@@ -22,6 +22,70 @@ INVALIDATION = {"InvalidChannelError", "InvalidClientError", "ClosedChannelError
 TRANSIENT = {408, 429, 500, 502, 503, 504}
 
 
+# Start here: create a source, connect, and stream retained events.
+
+def main():
+    source = SampleEventSource(
+        int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000")),
+        int(os.environ.get("SNOWFLAKE_SOURCE_CHECKPOINT", "0")),
+    )
+    producer = NamedProducer()
+    completed = False
+    try:
+        run(producer, source)
+        completed = True
+        print(f"Committed source checkpoint: {source.committed}")
+    finally:
+        if not completed:
+            print(f"Stopped. Retain source events after checkpoint {source.committed} for replay")
+        producer.close(completed)
+
+
+
+def run(producer, source):
+    # Snowflake, not local submission, determines the restart position.
+    source.seek(producer.open())
+    last_submitted_offset = source.committed
+    uncommitted_count = 0
+    retry_attempts = 0
+    deadline = time.monotonic() + OUTAGE_SECONDS
+    checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
+    event = None
+    while True:
+        try:
+            if event is None:
+                event = source.read()
+            if event is None:
+                if uncommitted_count:
+                    confirm_checkpoint(producer, last_submitted_offset, source, deadline)
+                return
+            remaining(deadline)
+            source_offset, row = event
+            # Write immediately; the SDK, not this loop, batches the transport.
+            producer.channel.append_row(row, str(source_offset))
+            last_submitted_offset = event[0]
+            event = None
+            uncommitted_count += 1
+            if uncommitted_count >= CHECKPOINT_ROWS or time.monotonic() >= checkpoint_at:
+                confirm_checkpoint(producer, last_submitted_offset, source, deadline)
+                uncommitted_count = 0
+                retry_attempts = 0
+                deadline = time.monotonic() + OUTAGE_SECONDS
+                checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
+        except StreamingIngestError as error:
+            retry_attempts += 1
+            if not retryable(error) or retry_attempts >= MAX_ATTEMPTS:
+                raise
+            if error.error_code.value in INVALIDATION:
+                source.seek(producer.recover(error))
+                last_submitted_offset = source.committed
+                uncommitted_count = 0
+                event = None
+            backoff(retry_attempts - 1, deadline)
+
+
+# Supporting delivery and connection details.
+
 def retryable(error):
     return isinstance(error, StreamingIngestError) and (
         error.error_code.value in INVALIDATION or error.http_status_code in TRANSIENT
@@ -61,8 +125,11 @@ def create_client():
     )
 
 
-class ReplaySource:
-    """Regenerates fixed events after restart; acknowledgement is only in-memory."""
+class SampleEventSource:
+    """Synthetic input only: no external source and no persisted checkpoint.
+
+    Replace read/acknowledge/seek with your retained source operations.
+    """
 
     def __init__(self, total=10_000, checkpoint=0):
         if not 0 <= checkpoint <= total:
@@ -77,14 +144,18 @@ class ReplaySource:
             return None
         offset = self.next_offset
         self.next_offset += 1
-        return offset, {"EVENT_ID": offset, "C1": offset, "C2": f"event-{offset}"}
+        # Replace this mapping with your target table columns and stable event ID.
+        row = {"EVENT_ID": offset, "C1": offset, "C2": f"event-{offset}"}
+        return offset, row
 
     def acknowledge(self, offset):
+        # In production, persist/commit source progress here before retiring events.
         if not self.committed <= offset <= self.total:
             raise ValueError("Invalid source checkpoint")
         self.committed = offset
 
     def seek(self, committed):
+        # Position the retained source strictly after Snowflake committed progress.
         self.acknowledge(committed)
         self.next_offset = committed + 1
 
@@ -156,63 +227,6 @@ def confirm_checkpoint(producer, target, source, deadline):
             if error.error_code.value in INVALIDATION or not retryable(error):
                 raise
             backoff(0, deadline)
-
-
-def run(producer, source):
-    # Snowflake, not local submission, determines the restart position.
-    source.seek(producer.open())
-    last_submitted_offset = source.committed
-    uncommitted_count = 0
-    retry_attempts = 0
-    deadline = time.monotonic() + OUTAGE_SECONDS
-    checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
-    event = None
-    while True:
-        try:
-            if event is None:
-                event = source.read()
-            if event is None:
-                if uncommitted_count:
-                    confirm_checkpoint(producer, last_submitted_offset, source, deadline)
-                return
-            remaining(deadline)
-            producer.channel.append_row(event[1], str(event[0]))
-            last_submitted_offset = event[0]
-            event = None
-            uncommitted_count += 1
-            if uncommitted_count >= CHECKPOINT_ROWS or time.monotonic() >= checkpoint_at:
-                confirm_checkpoint(producer, last_submitted_offset, source, deadline)
-                uncommitted_count = 0
-                retry_attempts = 0
-                deadline = time.monotonic() + OUTAGE_SECONDS
-                checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
-        except StreamingIngestError as error:
-            retry_attempts += 1
-            if not retryable(error) or retry_attempts >= MAX_ATTEMPTS:
-                raise
-            if error.error_code.value in INVALIDATION:
-                source.seek(producer.recover(error))
-                last_submitted_offset = source.committed
-                uncommitted_count = 0
-                event = None
-            backoff(retry_attempts - 1, deadline)
-
-
-def main():
-    source = ReplaySource(
-        int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000")),
-        int(os.environ.get("SNOWFLAKE_SOURCE_CHECKPOINT", "0")),
-    )
-    producer = NamedProducer()
-    completed = False
-    try:
-        run(producer, source)
-        completed = True
-        print(f"Committed source checkpoint: {source.committed}")
-    finally:
-        if not completed:
-            print(f"Stopped. Retain source events after checkpoint {source.committed} for replay")
-        producer.close(completed)
 
 
 if __name__ == "__main__":

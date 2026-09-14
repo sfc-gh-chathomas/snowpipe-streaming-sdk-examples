@@ -18,6 +18,47 @@ const INVALIDATION = new Set([
   "ClosedElasticChannelError", "ClosedClientError",
 ]);
 
+// Start here: source, connection, then the streaming loop.
+
+async function main() {
+  const source = new SampleEventSource(Number(process.env.SNOWFLAKE_TEST_ROWS || 10_000),
+    Number(process.env.SNOWFLAKE_SOURCE_CHECKPOINT || 0));
+  const producer = new ElasticProducer();
+  let completed = false;
+  try {
+    await producer.open();
+    await run(producer, source);
+    completed = true;
+    console.log(`Durable source checkpoint: ${source.committed}; materialization is separate`);
+  } finally {
+    if (!completed) console.error(`Stopped. Retain events after checkpoint ${source.committed} for replay`);
+    await producer.close(completed);
+  }
+}
+
+async function run(producer, source) {
+  const pending = [];
+  let checkpointAt = performance.now() + CHECKPOINT_MS;
+  let deadline = performance.now() + OUTAGE_MS;
+  while (true) {
+    // read() retains ownership; null means end-of-input, not temporary idle.
+    const event = source.read();
+    if (event === null) break;
+    const item = appendEvent(producer, event);
+    pending.push(item);
+    await Promise.resolve();
+    if (pending.some((entry) => entry.result?.error) || pending.length >= CHECKPOINT_ROWS
+        || performance.now() >= checkpointAt) {
+      await confirmCheckpoint(producer, pending, source, deadline);
+      checkpointAt = performance.now() + CHECKPOINT_MS;
+      deadline = performance.now() + OUTAGE_MS;
+    }
+  }
+  await confirmCheckpoint(producer, pending, source, deadline);
+}
+
+// Supporting delivery and connection details.
+
 function retryable(error) {
   return error instanceof StreamingIngestError &&
     (INVALIDATION.has(error.errorCode) || [408, 429, 500, 502, 503, 504].includes(error.httpStatusCode));
@@ -72,7 +113,7 @@ async function createClient() {
 }
 
 // Regenerable sample data only; a real source must retain events across restarts.
-class ReplaySource {
+class SampleEventSource {
   constructor(total = 10_000, checkpoint = 0) {
     if (!Number.isSafeInteger(total) || !Number.isSafeInteger(checkpoint) || checkpoint < 0 || checkpoint > total) {
       throw new Error("Require integer 0 <= source checkpoint <= total");
@@ -84,9 +125,11 @@ class ReplaySource {
   read() {
     if (this.nextOffset > this.total) return null;
     const offset = this.nextOffset++;
+    // Replace this mapping with your target columns and stable event ID.
     return { offset, row: { EVENT_ID: offset, C1: offset, C2: `event-${offset}` } };
   }
   acknowledge(offset) {
+    // Persist/commit source progress here before retiring real source events.
     if (offset < this.committed || offset > this.total) throw new Error("Invalid source checkpoint");
     this.committed = offset;
   }
@@ -134,6 +177,7 @@ function appendEvent(producer, event) {
   // Observe rejection immediately, even while other events are being read.
   let promise;
   try {
+    // This is the Snowflake write; keep its original acknowledgement Promise.
     promise = producer.channel.appendRowWithWait(event.row, String(event.offset));
   } catch (error) {
     promise = Promise.reject(error);
@@ -169,46 +213,10 @@ async function confirmCheckpoint(producer, pending, source, deadline) {
   }
 }
 
-async function run(producer, source) {
-  const pending = [];
-  let checkpointAt = performance.now() + CHECKPOINT_MS;
-  let deadline = performance.now() + OUTAGE_MS;
-  while (true) {
-    const event = source.read();
-    if (event === null) break;
-    const item = appendEvent(producer, event);
-    pending.push(item);
-    await Promise.resolve();
-    if (pending.some((entry) => entry.result?.error) || pending.length >= CHECKPOINT_ROWS
-        || performance.now() >= checkpointAt) {
-      await confirmCheckpoint(producer, pending, source, deadline);
-      checkpointAt = performance.now() + CHECKPOINT_MS;
-      deadline = performance.now() + OUTAGE_MS;
-    }
-  }
-  await confirmCheckpoint(producer, pending, source, deadline);
-}
-
-async function main() {
-  const source = new ReplaySource(Number(process.env.SNOWFLAKE_TEST_ROWS || 10_000),
-    Number(process.env.SNOWFLAKE_SOURCE_CHECKPOINT || 0));
-  const producer = new ElasticProducer();
-  let completed = false;
-  try {
-    await producer.open();
-    await run(producer, source);
-    completed = true;
-    console.log(`Durable source checkpoint: ${source.committed}; materialization is separate`);
-  } finally {
-    if (!completed) console.error(`Stopped. Retain events after checkpoint ${source.committed} for replay`);
-    await producer.close(completed);
-  }
-}
-
 if (require.main === module) {
   const keepAlive = setInterval(() => {}, 1_000);
   main().catch((error) => { console.error(error.message); process.exitCode = 1; })
     .finally(() => clearInterval(keepAlive));
 }
 
-module.exports = { ReplaySource, retryable, remaining, backoff, createClient, CHECKPOINT_ROWS, MAX_ATTEMPTS, poll,  ElasticProducer, appendEvent, confirmCheckpoint, run, main };
+module.exports = { SampleEventSource, retryable, remaining, backoff, createClient, CHECKPOINT_ROWS, MAX_ATTEMPTS, poll,  ElasticProducer, appendEvent, confirmCheckpoint, run, main };

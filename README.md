@@ -27,7 +27,7 @@ progress unchanged. These are application settings, not SDK default timeouts. SD
 have their own transport timeouts and retries; the application deadline does not cancel those calls.
 
 The producer application must retain or be able to replay unacknowledged events. The included
-`ReplaySource` regenerates fixed sample events; its checkpoint is in-memory and it is **not durable storage**.
+`SampleEventSource` generates fixed sample events; its checkpoint is in-memory and it is **not durable storage**.
 Replace `read`, `acknowledge`, and `seek` with your application's retained log, outbox, or source APIs.
 For push sources, implement upstream flow control instead of merely ceasing reads. If events cannot be
 replayed and must survive a restart, persist them in a bounded producer-local buffer before accepting

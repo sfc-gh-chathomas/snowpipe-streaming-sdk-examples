@@ -58,7 +58,7 @@ def no_sleep(monkeypatch):
 
 def test_restart_seeks_after_server_committed_offset():
     session = Session(2)
-    source = support.ReplaySource(5)
+    source = support.SampleEventSource(5)
     named.run(session, source)
     assert session.channel.calls == [3, 4, 5]
     assert session.channel.waits == 1
@@ -67,7 +67,7 @@ def test_restart_seeks_after_server_committed_offset():
 
 def test_429_retains_current_event_without_reading_next():
     session = Session()
-    source = support.ReplaySource(3)
+    source = support.SampleEventSource(3)
 
     def pressure(offset):
         assert source.next_offset == offset + 1
@@ -91,7 +91,7 @@ def test_invalidation_replays_after_server_committed_record(code):
             raise error(code, 409)
 
     session.channel.on_append = invalidate
-    source = support.ReplaySource(4)
+    source = support.SampleEventSource(4)
     named.run(session, source)
     assert session.channel.calls == [1, 2, 3, 3, 4]
     assert session.recoveries == 1
@@ -107,7 +107,7 @@ def test_wait_timeout_does_not_reopen_or_resubmit():
         raise TimeoutError("local polling timeout")
 
     session.channel.wait_for_commit = delayed
-    source = support.ReplaySource(2)
+    source = support.SampleEventSource(2)
     named.run(session, source)
     assert session.recoveries == 0
     assert session.channel.calls == [1, 2]
@@ -117,7 +117,7 @@ def test_wait_timeout_does_not_reopen_or_resubmit():
 def test_row_errors_prevent_source_handoff():
     session = Session()
     session.channel.errors = 1
-    source = support.ReplaySource(2)
+    source = support.SampleEventSource(2)
     with pytest.raises(RuntimeError, match="Row errors"):
         named.run(session, source)
     assert source.committed == 0
@@ -126,7 +126,7 @@ def test_row_errors_prevent_source_handoff():
 def test_permanent_failure_preserves_checkpoint():
     session = Session()
     session.channel.on_append = lambda _: (_ for _ in ()).throw(error(StreamingIngestErrorCode.SF_API_AUTH_ERROR, 403))
-    source = support.ReplaySource(3)
+    source = support.SampleEventSource(3)
     with pytest.raises(StreamingIngestError):
         named.run(session, source)
     assert source.committed == 0
@@ -134,7 +134,7 @@ def test_permanent_failure_preserves_checkpoint():
 
 
 def test_expired_checkpoint_does_not_advance():
-    source = support.ReplaySource(3)
+    source = support.SampleEventSource(3)
     with pytest.raises(TimeoutError):
         named.confirm_checkpoint(Session(), 3, source, support.time.monotonic() - 1)
     assert source.committed == 0
@@ -142,7 +142,7 @@ def test_expired_checkpoint_does_not_advance():
 
 def test_fully_committed_source_has_no_appends():
     session = Session(3)
-    source = support.ReplaySource(3)
+    source = support.SampleEventSource(3)
     named.run(session, source)
     assert session.channel.calls == []
     assert source.committed == 3

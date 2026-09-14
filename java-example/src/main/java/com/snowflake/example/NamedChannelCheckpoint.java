@@ -28,6 +28,68 @@ public class NamedChannelCheckpoint {
     static final long OUTAGE_NANOS = TimeUnit.MINUTES.toNanos(5);
     static final int MAX_ATTEMPTS = 6;
 
+    // Start here: create a source, connect, and stream retained events.
+    public static void main(String[] args) throws Exception {
+        SampleEventSource source = new SampleEventSource(
+                Long.parseLong(env("SNOWFLAKE_TEST_ROWS", "10000")),
+                Long.parseLong(env("SNOWFLAKE_SOURCE_CHECKPOINT", "0")));
+        Producer producer = new Producer(NamedChannelCheckpoint::createClient);
+        boolean completed = false;
+        try {
+            run(producer, source);
+            completed = true;
+            System.out.println("Committed source checkpoint: " + source.committed);
+        } finally {
+            if (!completed) System.err.println("Retain source events after checkpoint " + source.committed);
+            producer.close(completed);
+        }
+    }
+
+    static void run(Producer producer, SampleEventSource source) throws Exception {
+        // The server checkpoint is authoritative when restarting this source.
+        source.seek(producer.open());
+        long lastSubmittedOffset = source.committed;
+        int uncommittedCount = 0;
+        int retryAttempts = 0;
+        Event event = null;
+        long deadline = System.nanoTime() + OUTAGE_NANOS;
+        long checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
+        while (true) {
+            try {
+                if (event == null) event = source.read();
+                if (event == null) {
+                    if (uncommittedCount > 0) confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
+                    return;
+                }
+                remaining(deadline);
+                // Write immediately; the SDK handles transport batching.
+                producer.channel.appendRow(event.row, String.valueOf(event.offset));
+                lastSubmittedOffset = event.offset;
+                event = null;
+                uncommittedCount++;
+                if (uncommittedCount >= CHECKPOINT_ROWS || System.nanoTime() >= checkpointAt) {
+                    confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
+                    uncommittedCount = 0;
+                    retryAttempts = 0;
+                    deadline = System.nanoTime() + OUTAGE_NANOS;
+                    checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
+                }
+            } catch (SFException error) {
+                if (!retryable(error) || ++retryAttempts >= MAX_ATTEMPTS) throw error;
+                if (invalidation(error)) {
+                    source.seek(producer.recover(error));
+                    lastSubmittedOffset = source.committed;
+                    uncommittedCount = 0;
+                    event = null;
+                }
+                backoff(retryAttempts - 1, deadline);
+            }
+        }
+    }
+
+
+
+    // Supporting delivery and connection details.
     static boolean invalidation(SFException error) {
         String code = error.getErrorCodeName();
         return "InvalidChannelError".equals(code) || "InvalidClientError".equals(code)
@@ -92,16 +154,17 @@ public class NamedChannelCheckpoint {
         final Map<String, Object> row;
         Event(long offset) {
             this.offset = offset;
+            // Replace this mapping with your table columns and stable event ID.
             this.row = Map.of("EVENT_ID", offset, "C1", offset, "C2", "event-" + offset);
         }
     }
 
-    /** Deterministic replay fixture; its source checkpoint is not persisted. */
-    static class ReplaySource {
+    /** Synthetic input only. Replace read/acknowledge/seek with retained source operations. */
+    static class SampleEventSource {
         final long total;
         long committed;
         long nextOffset;
-        ReplaySource(long total, long checkpoint) {
+        SampleEventSource(long total, long checkpoint) {
             if (checkpoint < 0 || checkpoint > total) throw new IllegalArgumentException("Invalid checkpoint");
             this.total = total;
             this.committed = checkpoint;
@@ -109,6 +172,7 @@ public class NamedChannelCheckpoint {
         }
         Event read() { return nextOffset > total ? null : new Event(nextOffset++); }
         void acknowledge(long offset) {
+            // Persist source progress before retiring real source events.
             if (offset < committed || offset > total) throw new IllegalArgumentException("Invalid checkpoint");
             committed = offset;
         }
@@ -168,7 +232,7 @@ public class NamedChannelCheckpoint {
         }
     }
 
-    static void confirmCheckpoint(Producer producer, long target, ReplaySource source,
+    static void confirmCheckpoint(Producer producer, long target, SampleEventSource source,
                            long deadline) throws Exception {
         while (true) {
             remaining(deadline);
@@ -189,60 +253,5 @@ public class NamedChannelCheckpoint {
         }
     }
 
-    static void run(Producer producer, ReplaySource source) throws Exception {
-        // The server checkpoint is authoritative when restarting this source.
-        source.seek(producer.open());
-        long lastSubmittedOffset = source.committed;
-        int uncommittedCount = 0;
-        int retryAttempts = 0;
-        Event event = null;
-        long deadline = System.nanoTime() + OUTAGE_NANOS;
-        long checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
-        while (true) {
-            try {
-                if (event == null) event = source.read();
-                if (event == null) {
-                    if (uncommittedCount > 0) confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
-                    return;
-                }
-                remaining(deadline);
-                producer.channel.appendRow(event.row, String.valueOf(event.offset));
-                lastSubmittedOffset = event.offset;
-                event = null;
-                uncommittedCount++;
-                if (uncommittedCount >= CHECKPOINT_ROWS || System.nanoTime() >= checkpointAt) {
-                    confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
-                    uncommittedCount = 0;
-                    retryAttempts = 0;
-                    deadline = System.nanoTime() + OUTAGE_NANOS;
-                    checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
-                }
-            } catch (SFException error) {
-                if (!retryable(error) || ++retryAttempts >= MAX_ATTEMPTS) throw error;
-                if (invalidation(error)) {
-                    source.seek(producer.recover(error));
-                    lastSubmittedOffset = source.committed;
-                    uncommittedCount = 0;
-                    event = null;
-                }
-                backoff(retryAttempts - 1, deadline);
-            }
-        }
-    }
 
-    public static void main(String[] args) throws Exception {
-        ReplaySource source = new ReplaySource(
-                Long.parseLong(env("SNOWFLAKE_TEST_ROWS", "10000")),
-                Long.parseLong(env("SNOWFLAKE_SOURCE_CHECKPOINT", "0")));
-        Producer producer = new Producer(NamedChannelCheckpoint::createClient);
-        boolean completed = false;
-        try {
-            run(producer, source);
-            completed = true;
-            System.out.println("Committed source checkpoint: " + source.committed);
-        } finally {
-            if (!completed) System.err.println("Retain source events after checkpoint " + source.committed);
-            producer.close(completed);
-        }
-    }
 }

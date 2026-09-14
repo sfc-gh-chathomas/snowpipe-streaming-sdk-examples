@@ -17,6 +17,67 @@ const INVALIDATION = new Set([
   "ClosedElasticChannelError", "ClosedClientError",
 ]);
 
+// Start here: source, connection, then the streaming loop.
+
+async function main() {
+  const source = new SampleEventSource(Number(process.env.SNOWFLAKE_TEST_ROWS || 10_000),
+    Number(process.env.SNOWFLAKE_SOURCE_CHECKPOINT || 0));
+  const producer = new NamedProducer();
+  let completed = false;
+  try {
+    await run(producer, source);
+    completed = true;
+    console.log(`Committed source checkpoint: ${source.committed}`);
+  } finally {
+    if (!completed) console.error(`Stopped. Retain events after checkpoint ${source.committed} for replay`);
+    await producer.close(completed);
+  }
+}
+
+async function run(producer, source) {
+  // Resume after the server checkpoint, never after the last submitted event.
+  source.seek(await producer.open());
+  let lastSubmittedOffset = source.committed;
+  let uncommittedCount = 0;
+  let retryAttempts = 0;
+  let event = null;
+  let deadline = performance.now() + OUTAGE_MS;
+  let checkpointAt = performance.now() + CHECKPOINT_MS;
+  while (true) {
+    try {
+      if (event === null) event = source.read();
+      if (event === null) {
+        if (uncommittedCount) await confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
+        return;
+      }
+      remaining(deadline);
+      // Write immediately; the SDK handles transport batching.
+      producer.channel.appendRow(event.row, String(event.offset));
+      lastSubmittedOffset = event.offset;
+      event = null;
+      uncommittedCount++;
+      if (uncommittedCount >= CHECKPOINT_ROWS || performance.now() >= checkpointAt) {
+        await confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
+        uncommittedCount = 0;
+        retryAttempts = 0;
+        deadline = performance.now() + OUTAGE_MS;
+        checkpointAt = performance.now() + CHECKPOINT_MS;
+      }
+    } catch (error) {
+      if (!retryable(error) || ++retryAttempts >= MAX_ATTEMPTS) throw error;
+      if (INVALIDATION.has(error.errorCode)) {
+        source.seek(await producer.recover(error));
+        lastSubmittedOffset = source.committed;
+        uncommittedCount = 0;
+        event = null;
+      }
+      await backoff(retryAttempts - 1, deadline);
+    }
+  }
+}
+
+// Supporting delivery and connection details.
+
 function retryable(error) {
   return error instanceof StreamingIngestError &&
     (INVALIDATION.has(error.errorCode) || [408, 429, 500, 502, 503, 504].includes(error.httpStatusCode));
@@ -59,7 +120,7 @@ async function createClient() {
 }
 
 // Regenerable sample data only; a real source must retain events across restarts.
-class ReplaySource {
+class SampleEventSource {
   constructor(total = 10_000, checkpoint = 0) {
     if (!Number.isSafeInteger(total) || !Number.isSafeInteger(checkpoint) || checkpoint < 0 || checkpoint > total) {
       throw new Error("Require integer 0 <= source checkpoint <= total");
@@ -71,9 +132,11 @@ class ReplaySource {
   read() {
     if (this.nextOffset > this.total) return null;
     const offset = this.nextOffset++;
+    // Replace this mapping with your target columns and stable event ID.
     return { offset, row: { EVENT_ID: offset, C1: offset, C2: `event-${offset}` } };
   }
   acknowledge(offset) {
+    // Persist/commit source progress here before retiring real source events.
     if (offset < this.committed || offset > this.total) throw new Error("Invalid source checkpoint");
     this.committed = offset;
   }
@@ -149,66 +212,10 @@ async function confirmCheckpoint(producer, target, source, deadline) {
   }
 }
 
-async function run(producer, source) {
-  // Resume after the server checkpoint, never after the last lastSubmittedOffset event.
-  source.seek(await producer.open());
-  let lastSubmittedOffset = source.committed;
-  let uncommittedCount = 0;
-  let retryAttempts = 0;
-  let event = null;
-  let deadline = performance.now() + OUTAGE_MS;
-  let checkpointAt = performance.now() + CHECKPOINT_MS;
-  while (true) {
-    try {
-      if (event === null) event = source.read();
-      if (event === null) {
-        if (uncommittedCount) await confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
-        return;
-      }
-      remaining(deadline);
-      producer.channel.appendRow(event.row, String(event.offset));
-      lastSubmittedOffset = event.offset;
-      event = null;
-      uncommittedCount++;
-      if (uncommittedCount >= CHECKPOINT_ROWS || performance.now() >= checkpointAt) {
-        await confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
-        uncommittedCount = 0;
-        retryAttempts = 0;
-        deadline = performance.now() + OUTAGE_MS;
-        checkpointAt = performance.now() + CHECKPOINT_MS;
-      }
-    } catch (error) {
-      if (!retryable(error) || ++retryAttempts >= MAX_ATTEMPTS) throw error;
-      if (INVALIDATION.has(error.errorCode)) {
-        source.seek(await producer.recover(error));
-        lastSubmittedOffset = source.committed;
-        uncommittedCount = 0;
-        event = null;
-      }
-      await backoff(retryAttempts - 1, deadline);
-    }
-  }
-}
-
-async function main() {
-  const source = new ReplaySource(Number(process.env.SNOWFLAKE_TEST_ROWS || 10_000),
-    Number(process.env.SNOWFLAKE_SOURCE_CHECKPOINT || 0));
-  const producer = new NamedProducer();
-  let completed = false;
-  try {
-    await run(producer, source);
-    completed = true;
-    console.log(`Committed source checkpoint: ${source.committed}`);
-  } finally {
-    if (!completed) console.error(`Stopped. Retain events after checkpoint ${source.committed} for replay`);
-    await producer.close(completed);
-  }
-}
-
 if (require.main === module) {
   const keepAlive = setInterval(() => {}, 1_000);
   main().catch((error) => { console.error(error.message); process.exitCode = 1; })
     .finally(() => clearInterval(keepAlive));
 }
 
-module.exports = { ReplaySource, retryable, remaining, backoff, createClient, CHECKPOINT_ROWS, MAX_ATTEMPTS,  NamedProducer, parseOffset, confirmCheckpoint, run, main };
+module.exports = { SampleEventSource, retryable, remaining, backoff, createClient, CHECKPOINT_ROWS, MAX_ATTEMPTS,  NamedProducer, parseOffset, confirmCheckpoint, run, main };
