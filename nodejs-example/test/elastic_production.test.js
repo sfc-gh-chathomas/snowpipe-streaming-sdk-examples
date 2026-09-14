@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 const { StreamingIngestError } = require("snowpipe-streaming");
 const elastic = require("../elastic_production.js");
 const named = require("../named_channel_checkpoint.js");
-const support = require("../production_support.js");
+const support = elastic;
 
 const error = (code, status) => new StreamingIngestError(code, "synthetic", status, String(status));
 const deadline = () => performance.now() + 500;
@@ -29,7 +29,7 @@ function elasticClient(outcomes = []) {
 
 test("Elastic appends before reading the next retained event", async () => {
   const client = elasticClient();
-  const session = new elastic.ElasticSession(async () => client);
+  const session = new elastic.ElasticProducer(async () => client);
   await session.open();
   class Source extends support.ReplaySource {
     read() {
@@ -47,15 +47,15 @@ test("caller polling timeout retains original promise; late success advances che
   let resolve;
   const original = new Promise((done) => { resolve = done; });
   const client = elasticClient([original]);
-  const session = new elastic.ElasticSession(async () => client);
+  const session = new elastic.ElasticProducer(async () => client);
   await session.open();
   const source = new support.ReplaySource(1);
-  const pending = [elastic.submit(session, source.read())];
+  const pending = [elastic.appendEvent(session, source.read())];
   const waiting = await support.poll(pending[0].outcome, 1);
   assert.equal(waiting.waiting, true);
   assert.equal(source.committed, 0);
   resolve();
-  await elastic.checkpoint(session, pending, source, deadline());
+  await elastic.confirmCheckpoint(session, pending, source, deadline());
   assert.deepEqual(client.calls, ["1"]);
   assert.deepEqual(client.closes, []);
   assert.equal(session.generation, 1);
@@ -64,23 +64,23 @@ test("caller polling timeout retains original promise; late success advances che
 
 test("out-of-order success cannot acknowledge an earlier gap", async () => {
   const client = elasticClient([new Promise(() => {}), Promise.resolve()]);
-  const session = new elastic.ElasticSession(async () => client);
+  const session = new elastic.ElasticProducer(async () => client);
   await session.open();
   const source = new support.ReplaySource(2);
-  const pending = [elastic.submit(session, source.read()), elastic.submit(session, source.read())];
-  await assert.rejects(elastic.checkpoint(session, pending, source, performance.now() + 5), /Outage/);
+  const pending = [elastic.appendEvent(session, source.read()), elastic.appendEvent(session, source.read())];
+  await assert.rejects(elastic.confirmCheckpoint(session, pending, source, performance.now() + 5), /Outage/);
   assert.equal(source.committed, 0);
   assert.equal(pending.length, 2);
   assert.deepEqual(client.closes, []);
 });
 
 test("checkpoint count bounds source intake", async (context) => {
-  context.mock.method(support, "backoff", async () => {});
+  context.mock.method(Math, "random", () => 0);
   const limit = support.CHECKPOINT_ROWS;
   let resolve;
   const blocked = new Promise((done) => { resolve = done; });
   const client = elasticClient([blocked]);
-  const session = new elastic.ElasticSession(async () => client);
+  const session = new elastic.ElasticProducer(async () => client);
   await session.open();
   const source = new support.ReplaySource(limit + 1);
   const running = elastic.run(session, source);
@@ -94,9 +94,9 @@ test("checkpoint count bounds source intake", async (context) => {
 });
 
 test("429 retries the rejected event on the same client", async (context) => {
-  context.mock.method(support, "backoff", async () => {});
+  context.mock.method(Math, "random", () => 0);
   const client = elasticClient([error("ReceiverSaturated", 429)]);
-  const session = new elastic.ElasticSession(async () => client);
+  const session = new elastic.ElasticProducer(async () => client);
   await session.open();
   const source = new support.ReplaySource(1);
   await elastic.run(session, source);
@@ -106,15 +106,15 @@ test("429 retries the rejected event on the same client", async (context) => {
 });
 
 test("SDK invalidation rebuilds once for a failed generation and skips successful events", async (context) => {
-  context.mock.method(support, "backoff", async () => {});
+  context.mock.method(Math, "random", () => 0);
   const old = elasticClient([Promise.resolve(), error("InvalidChannelError", 409), error("InvalidClientError", 409)]);
   const fresh = elasticClient();
   const clients = [old, fresh];
-  const session = new elastic.ElasticSession(async () => clients.shift());
+  const session = new elastic.ElasticProducer(async () => clients.shift());
   await session.open();
   const source = new support.ReplaySource(3);
-  const pending = Array.from({ length: 3 }, () => elastic.submit(session, source.read()));
-  await elastic.checkpoint(session, pending, source, deadline());
+  const pending = Array.from({ length: 3 }, () => elastic.appendEvent(session, source.read()));
+  await elastic.confirmCheckpoint(session, pending, source, deadline());
   assert.deepEqual(fresh.calls, ["2", "3"]);
   assert.equal(old.closes.length, 1);
   assert.equal(session.generation, 2);
@@ -124,7 +124,7 @@ test("SDK invalidation rebuilds once for a failed generation and skips successfu
 for (const status of [400, 401, 403, 404]) {
   test(`permanent ${status} preserves retained source checkpoint`, async () => {
     const client = elasticClient([error("SfApiUserError", status)]);
-    const session = new elastic.ElasticSession(async () => client);
+    const session = new elastic.ElasticProducer(async () => client);
     await session.open();
     const source = new support.ReplaySource(1);
     await assert.rejects(elastic.run(session, source), (failure) => failure.httpStatusCode === status);
@@ -134,9 +134,9 @@ for (const status of [400, 401, 403, 404]) {
 }
 
 test("terminal SDK retry exhaustion stops with uncommitted source work", async (context) => {
-  context.mock.method(support, "backoff", async () => {});
+  context.mock.method(Math, "random", () => 0);
   const client = elasticClient(Array.from({ length: support.MAX_ATTEMPTS }, () => error("HttpRetriesExhaustedError", 503)));
-  const session = new elastic.ElasticSession(async () => client);
+  const session = new elastic.ElasticProducer(async () => client);
   await session.open();
   const source = new support.ReplaySource(1);
   await assert.rejects(elastic.run(session, source));
@@ -173,7 +173,7 @@ test("named restart seeks strictly after server committed offset", async () => {
 });
 
 test("named backpressure retains current event", async (context) => {
-  context.mock.method(support, "backoff", async () => {});
+  context.mock.method(Math, "random", () => 0);
   const session = namedSession();
   const source = new support.ReplaySource(3);
   session.onAppend = (offset) => {
@@ -187,7 +187,7 @@ test("named backpressure retains current event", async (context) => {
 });
 
 test("named invalidation resumes from server offset without resetting it", async (context) => {
-  context.mock.method(support, "backoff", async () => {});
+  context.mock.method(Math, "random", () => 0);
   const session = namedSession();
   session.onAppend = (offset) => {
     if (offset === 3) {
@@ -203,7 +203,7 @@ test("named invalidation resumes from server offset without resetting it", async
 });
 
 test("named delayed status keeps intake paused without reopening", async (context) => {
-  context.mock.method(support, "backoff", async () => {});
+  context.mock.method(Math, "random", () => 0);
   const session = namedSession();
   const source = new support.ReplaySource(2);
   let polls = 0;
@@ -219,7 +219,7 @@ test("named delayed status keeps intake paused without reopening", async (contex
 });
 
 test("named closed channel recovers from committed offset", async (context) => {
-  context.mock.method(support, "backoff", async () => {});
+  context.mock.method(Math, "random", () => 0);
   const session = namedSession();
   session.onAppend = () => {
     session.onAppend = null;
@@ -246,4 +246,14 @@ test("replay source regenerates stable payload and source checkpoint is explicit
   const event = source.read();
   assert.deepEqual(new support.ReplaySource(3, 1).read(), event);
   assert.equal(source.committed, 0);
+});
+
+
+test("production examples require no sibling support module", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  for (const file of ["elastic_production.js", "named_channel_checkpoint.js"]) {
+    const code = fs.readFileSync(path.join(__dirname, "..", file), "utf8");
+    assert.doesNotMatch(code, /require\(["']\.\//);
+  }
 });

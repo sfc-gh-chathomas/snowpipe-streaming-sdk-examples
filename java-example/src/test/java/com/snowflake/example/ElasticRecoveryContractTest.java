@@ -52,10 +52,10 @@ class ElasticRecoveryContractTest {
     @Test
     void appendPrecedesNextReadAndFinalAckCoversAllEvents() throws Exception {
         FakeClient fake = new FakeClient();
-        ElasticProducer.Session session = new ElasticProducer.Session(() -> fake.client);
+        ElasticProducer.Producer session = new ElasticProducer.Producer(() -> fake.client);
         session.open();
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(3, 0) {
-            @Override ProductionSupport.Event read() {
+        ElasticProducer.ReplaySource source = new ElasticProducer.ReplaySource(3, 0) {
+            @Override ElasticProducer.Event read() {
                 assertEquals(nextOffset - 1, fake.calls.size());
                 return super.read();
             }
@@ -76,12 +76,12 @@ class ElasticRecoveryContractTest {
             }
         };
         FakeClient fake = new FakeClient(late);
-        ElasticProducer.Session session = new ElasticProducer.Session(() -> fake.client);
+        ElasticProducer.Producer session = new ElasticProducer.Producer(() -> fake.client);
         session.open();
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(1, 0);
+        ElasticProducer.ReplaySource source = new ElasticProducer.ReplaySource(1, 0);
         List<ElasticProducer.Pending> pending = new ArrayList<>();
-        pending.add(ElasticProducer.submit(session, source.read(), deadline()));
-        ElasticProducer.checkpoint(session, pending, source, deadline());
+        pending.add(ElasticProducer.appendEvent(session, source.read(), deadline()));
+        ElasticProducer.confirmCheckpoint(session, pending, source, deadline());
         assertEquals(2, polls.get());
         assertEquals(1, fake.calls.size());
         assertEquals(0, fake.closes);
@@ -91,14 +91,14 @@ class ElasticRecoveryContractTest {
     @Test
     void outageDeadlineDoesNotAdvanceOrCancelPendingWork() throws Exception {
         FakeClient fake = new FakeClient();
-        ElasticProducer.Session session = new ElasticProducer.Session(() -> fake.client);
+        ElasticProducer.Producer session = new ElasticProducer.Producer(() -> fake.client);
         session.open();
         CompletableFuture<Void> waiting = new CompletableFuture<>();
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(1, 0);
+        ElasticProducer.ReplaySource source = new ElasticProducer.ReplaySource(1, 0);
         List<ElasticProducer.Pending> pending = new ArrayList<>();
         pending.add(new ElasticProducer.Pending(source.read(), waiting, session.generation));
         assertThrows(TimeoutException.class,
-                () -> ElasticProducer.checkpoint(session, pending, source, System.nanoTime() - 1));
+                () -> ElasticProducer.confirmCheckpoint(session, pending, source, System.nanoTime() - 1));
         assertEquals(0, source.committed);
         assertFalse(waiting.isCancelled());
         assertEquals(1, pending.size());
@@ -107,9 +107,9 @@ class ElasticRecoveryContractTest {
     @Test
     void backpressureMidstreamPreservesPriorFutures() throws Exception {
         FakeClient fake = new FakeClient(CompletableFuture.completedFuture(null), failure("ReceiverSaturated", 429));
-        ElasticProducer.Session session = new ElasticProducer.Session(() -> fake.client);
+        ElasticProducer.Producer session = new ElasticProducer.Producer(() -> fake.client);
         session.open();
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(2, 0);
+        ElasticProducer.ReplaySource source = new ElasticProducer.ReplaySource(2, 0);
         ElasticProducer.run(session, source);
         assertEquals(Arrays.asList("1", "2", "2"), fake.calls);
         assertEquals(0, fake.closes);
@@ -123,12 +123,12 @@ class ElasticRecoveryContractTest {
                 CompletableFuture.failedFuture(failure("InvalidClientError", 409)));
         FakeClient fresh = new FakeClient();
         AtomicInteger builds = new AtomicInteger();
-        ElasticProducer.Session session = new ElasticProducer.Session(() -> builds.getAndIncrement() == 0 ? old.client : fresh.client);
+        ElasticProducer.Producer session = new ElasticProducer.Producer(() -> builds.getAndIncrement() == 0 ? old.client : fresh.client);
         session.open();
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(3, 0);
+        ElasticProducer.ReplaySource source = new ElasticProducer.ReplaySource(3, 0);
         List<ElasticProducer.Pending> pending = new ArrayList<>();
-        for (int index = 0; index < 3; index++) pending.add(ElasticProducer.submit(session, source.read(), deadline()));
-        ElasticProducer.checkpoint(session, pending, source, deadline());
+        for (int index = 0; index < 3; index++) pending.add(ElasticProducer.appendEvent(session, source.read(), deadline()));
+        ElasticProducer.confirmCheckpoint(session, pending, source, deadline());
         assertEquals(Arrays.asList("2", "3"), fresh.calls);
         assertEquals(2, builds.get());
         assertEquals(1, old.closes);
@@ -138,9 +138,9 @@ class ElasticRecoveryContractTest {
     @Test
     void permanentFailurePreservesSourceCheckpoint() throws Exception {
         FakeClient fake = new FakeClient(CompletableFuture.failedFuture(failure("SfApiUserError", 403)));
-        ElasticProducer.Session session = new ElasticProducer.Session(() -> fake.client);
+        ElasticProducer.Producer session = new ElasticProducer.Producer(() -> fake.client);
         session.open();
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(2, 0);
+        ElasticProducer.ReplaySource source = new ElasticProducer.ReplaySource(2, 0);
         assertThrows(SFException.class, () -> ElasticProducer.run(session, source));
         assertEquals(0, source.committed);
         assertEquals(Arrays.asList("1"), fake.calls);
@@ -192,8 +192,8 @@ class ElasticRecoveryContractTest {
     @Test
     void namedRestartSeeksAfterServerOffset() throws Exception {
         NamedFake fake = new NamedFake(2);
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(5, 0);
-        NamedChannelCheckpoint.run(new NamedChannelCheckpoint.Session(() -> fake.client), source);
+        NamedChannelCheckpoint.ReplaySource source = new NamedChannelCheckpoint.ReplaySource(5, 0);
+        NamedChannelCheckpoint.run(new NamedChannelCheckpoint.Producer(() -> fake.client), source);
         assertEquals(Arrays.asList(3L, 4L, 5L), fake.calls);
         assertEquals(5, source.committed);
         assertEquals(1, fake.opens);
@@ -203,8 +203,8 @@ class ElasticRecoveryContractTest {
     void namedInvalidationReplaysOnlyBeyondCommittedOffset() throws Exception {
         NamedFake fake = new NamedFake(0);
         fake.failThird = true;
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(4, 0);
-        NamedChannelCheckpoint.run(new NamedChannelCheckpoint.Session(() -> fake.client), source);
+        NamedChannelCheckpoint.ReplaySource source = new NamedChannelCheckpoint.ReplaySource(4, 0);
+        NamedChannelCheckpoint.run(new NamedChannelCheckpoint.Producer(() -> fake.client), source);
         assertEquals(Arrays.asList(1L, 2L, 3L, 3L, 4L), fake.calls);
         assertEquals(2, fake.opens);
         assertEquals(1, fake.closes);
@@ -215,8 +215,8 @@ class ElasticRecoveryContractTest {
     void namedBackpressureRetriesCurrentEventWithoutReopen() throws Exception {
         NamedFake fake = new NamedFake(0);
         fake.backpressure = true;
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(2, 0);
-        NamedChannelCheckpoint.run(new NamedChannelCheckpoint.Session(() -> fake.client), source);
+        NamedChannelCheckpoint.ReplaySource source = new NamedChannelCheckpoint.ReplaySource(2, 0);
+        NamedChannelCheckpoint.run(new NamedChannelCheckpoint.Producer(() -> fake.client), source);
         assertEquals(Arrays.asList(1L, 1L, 2L), fake.calls);
         assertEquals(1, fake.opens);
         assertEquals(2, source.committed);
@@ -227,8 +227,8 @@ class ElasticRecoveryContractTest {
         NamedFake fake = new NamedFake(0);
         fake.failThird = true;
         fake.invalidationCode = "ClosedChannelError";
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(4, 0);
-        NamedChannelCheckpoint.run(new NamedChannelCheckpoint.Session(() -> fake.client), source);
+        NamedChannelCheckpoint.ReplaySource source = new NamedChannelCheckpoint.ReplaySource(4, 0);
+        NamedChannelCheckpoint.run(new NamedChannelCheckpoint.Producer(() -> fake.client), source);
         assertEquals(Arrays.asList(1L, 2L, 3L, 3L, 4L), fake.calls);
         assertEquals(2, fake.opens);
         assertEquals(4, source.committed);
@@ -238,9 +238,9 @@ class ElasticRecoveryContractTest {
     void namedRowErrorsPreventSourceHandoff() {
         NamedFake fake = new NamedFake(0);
         fake.errors = 1;
-        ProductionSupport.ReplaySource source = new ProductionSupport.ReplaySource(2, 0);
+        NamedChannelCheckpoint.ReplaySource source = new NamedChannelCheckpoint.ReplaySource(2, 0);
         assertThrows(IllegalStateException.class,
-                () -> NamedChannelCheckpoint.run(new NamedChannelCheckpoint.Session(() -> fake.client), source));
+                () -> NamedChannelCheckpoint.run(new NamedChannelCheckpoint.Producer(() -> fake.client), source));
         assertEquals(0, source.committed);
     }
 }

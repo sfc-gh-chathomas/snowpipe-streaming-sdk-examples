@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import elastic_production_example as elastic
-import production_support as support
+support = elastic
 from snowflake.ingest.streaming import StreamingIngestError, StreamingIngestErrorCode
 
 
@@ -57,7 +57,7 @@ def fast_retry(monkeypatch):
 def session_for(*channels):
     clients = [Client(channel) for channel in channels]
     iterator = iter(clients)
-    session = elastic.ElasticSession(lambda: next(iterator))
+    session = elastic.ElasticProducer(lambda: next(iterator))
     session.open()
     return session, clients
 
@@ -113,8 +113,8 @@ def test_late_ack_keeps_original_future_and_client():
     channel = Channel([future])
     session, clients = session_for(channel)
     source = support.ReplaySource(1)
-    pending = [elastic.submit(session, source.read(), deadline())]
-    elastic.checkpoint(session, pending, source, deadline())
+    pending = [elastic.append_event(session, source.read(), deadline())]
+    elastic.confirm_checkpoint(session, pending, source, deadline())
     assert future.polls == 2
     assert channel.calls == ["1"]
     assert session.generation == 1
@@ -127,7 +127,7 @@ def test_outage_deadline_preserves_source_checkpoint():
     source = support.ReplaySource(1)
     pending = [elastic.Pending(source.read(), Future(), session.generation)]
     with pytest.raises(TimeoutError, match="retain events"):
-        elastic.checkpoint(session, pending, source, support.time.monotonic() - 1)
+        elastic.confirm_checkpoint(session, pending, source, support.time.monotonic() - 1)
     assert source.committed == 0
     assert len(pending) == 1
     assert not pending[0].future.cancelled()
@@ -150,8 +150,8 @@ def test_stale_invalidations_rebuild_only_once_and_skip_acked_rows():
     fresh = Channel()
     session, clients = session_for(old, fresh)
     source = support.ReplaySource(3)
-    pending = [elastic.submit(session, source.read(), deadline()) for _ in range(3)]
-    elastic.checkpoint(session, pending, source, deadline())
+    pending = [elastic.append_event(session, source.read(), deadline()) for _ in range(3)]
+    elastic.confirm_checkpoint(session, pending, source, deadline())
     assert fresh.calls == ["2", "3"]
     assert session.generation == 2
     assert len(clients[0].closes) == 1
@@ -188,10 +188,10 @@ def test_out_of_order_completion_does_not_commit_a_gap():
     session, _ = session_for(Channel())
     pending = [elastic.Pending(source.read(), future, 1), elastic.Pending(source.read(), later, 1)]
     with pytest.raises(TimeoutError):
-        elastic.checkpoint(session, pending, source, support.time.monotonic() - 1)
+        elastic.confirm_checkpoint(session, pending, source, support.time.monotonic() - 1)
     assert source.committed == 0
     future.set_result(None)
-    elastic.checkpoint(session, pending, source, deadline())
+    elastic.confirm_checkpoint(session, pending, source, deadline())
     assert source.committed == 2
 
 
@@ -201,3 +201,10 @@ def test_source_replay_is_deterministic_and_checkpoint_is_explicit():
     restarted = support.ReplaySource(3, checkpoint=1)
     assert restarted.read() == events[1]
     assert restarted.committed == 1
+
+
+def test_production_examples_have_no_local_support_import():
+    import inspect
+    import named_channel_checkpoint_example as named
+    for example in (elastic, named):
+        assert "production_support" not in inspect.getsource(example)

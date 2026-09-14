@@ -76,8 +76,8 @@ Copy `profile.json.example` to `profile.json` in the `java-example` directory an
 
 Edit the `DATABASE`, `SCHEMA`, and `TABLE` defaults, or set the matching `SNOWFLAKE_*` environment variables.
 
-The production programs share `ProductionSupport.java` for configuration, retry timing, and the
-deterministic replay fixture. PAT mode reads `SNOWFLAKE_PAT` from the environment and requires explicit
+Each production program includes its own configuration, retry timing, and replay fixture.
+No separate production helper library is required. PAT mode reads `SNOWFLAKE_PAT` from the environment and requires explicit
 `SNOWFLAKE_ACCOUNT` and `SNOWFLAKE_URL`; `SNOWFLAKE_ROLE` is optional. Otherwise they use `profile.json`
 (or `SNOWFLAKE_PROFILE`). No PM account or administrative role is selected by default.
 

@@ -17,7 +17,8 @@ Each language example below includes both an Elastic Channels path and a named-c
 
 ## Production retention contract
 
-Both production examples append each event immediately and leave transport batching to the SDK.
+Each production example is self-contained: SDK calls, configuration, retry decisions, and the replay
+fixture live in the same file. Both modes append immediately and leave transport batching to the SDK.
 They stop reading at a bounded checkpoint (1,000 events or five seconds checked between reads).
 Elastic checkpoints await every original acknowledgement; named checkpoints confirm the source offset
 through channel status. A polling timeout does not cancel an append, resend it, or reopen a client.

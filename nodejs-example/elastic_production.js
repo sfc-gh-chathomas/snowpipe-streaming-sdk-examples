@@ -6,10 +6,98 @@
  */
 "use strict";
 
-const support = require("./production_support.js");
+const { createTableClient, StreamingIngestError } = require("snowpipe-streaming");
 
-class ElasticSession {
-  constructor(factory = support.createClient) {
+const CHECKPOINT_ROWS = 1_000;
+const CHECKPOINT_MS = 5_000;
+const OUTAGE_MS = 300_000;
+const POLL_MS = 1_000;
+const MAX_ATTEMPTS = 6;
+const INVALIDATION = new Set([
+  "InvalidChannelError", "InvalidClientError", "ClosedChannelError",
+  "ClosedElasticChannelError", "ClosedClientError",
+]);
+
+function retryable(error) {
+  return error instanceof StreamingIngestError &&
+    (INVALIDATION.has(error.errorCode) || [408, 429, 500, 502, 503, 504].includes(error.httpStatusCode));
+}
+
+function remaining(deadline) {
+  const millis = deadline - performance.now();
+  if (millis <= 0) {
+    throw new Error("Outage deadline exceeded; source checkpoint unchanged; retain events for replay");
+  }
+  return millis;
+}
+
+async function backoff(attempt, deadline) {
+  const delay = Math.min(remaining(deadline), Math.random() * Math.min(10_000, 250 * 2 ** Math.min(attempt, 6)));
+  await new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+async function poll(outcome, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      outcome,
+      new Promise((resolve) => { timer = setTimeout(() => resolve({ waiting: true }), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function createClient() {
+  let authentication = { profilePath: process.env.SNOWFLAKE_PROFILE || "profile.json" };
+  if (process.env.SNOWFLAKE_PAT) {
+    if (!process.env.SNOWFLAKE_ACCOUNT || !process.env.SNOWFLAKE_URL) {
+      throw new Error("PAT mode requires SNOWFLAKE_ACCOUNT and SNOWFLAKE_URL");
+    }
+    authentication = { properties: {
+      authorization_type: "PAT",
+      personal_access_token: process.env.SNOWFLAKE_PAT,
+      account: process.env.SNOWFLAKE_ACCOUNT,
+      url: process.env.SNOWFLAKE_URL,
+      ...(process.env.SNOWFLAKE_ROLE ? { role: process.env.SNOWFLAKE_ROLE } : {}),
+    } };
+  }
+  return createTableClient({
+    clientName: `production-${process.pid}`,
+    dbName: process.env.SNOWFLAKE_DATABASE || "MY_DATABASE",
+    schemaName: process.env.SNOWFLAKE_SCHEMA || "MY_SCHEMA",
+    tableName: process.env.SNOWFLAKE_TABLE || "MY_TABLE",
+    ...authentication,
+  });
+}
+
+// Regenerable sample data only; a real source must retain events across restarts.
+class ReplaySource {
+  constructor(total = 10_000, checkpoint = 0) {
+    if (!Number.isSafeInteger(total) || !Number.isSafeInteger(checkpoint) || checkpoint < 0 || checkpoint > total) {
+      throw new Error("Require integer 0 <= source checkpoint <= total");
+    }
+    this.total = total;
+    this.committed = checkpoint;
+    this.nextOffset = checkpoint + 1;
+  }
+  read() {
+    if (this.nextOffset > this.total) return null;
+    const offset = this.nextOffset++;
+    return { offset, row: { EVENT_ID: offset, C1: offset, C2: `event-${offset}` } };
+  }
+  acknowledge(offset) {
+    if (offset < this.committed || offset > this.total) throw new Error("Invalid source checkpoint");
+    this.committed = offset;
+  }
+  seek(committed) {
+    this.acknowledge(committed);
+    this.nextOffset = committed + 1;
+  }
+}
+
+class ElasticProducer {
+  constructor(factory = createClient) {
     this.factory = factory;
     this.client = null;
     this.generation = 0;
@@ -26,6 +114,7 @@ class ElasticSession {
     this.generation++;
   }
   async recover(generation) {
+    // Old pending failures must not close the replacement client.
     if (generation !== this.generation) return;
     await this.close(false);
     await this.open();
@@ -41,71 +130,78 @@ class ElasticSession {
   }
 }
 
-function submit(session, event) {
+function appendEvent(producer, event) {
   // Observe rejection immediately, even while other events are being read.
   let promise;
   try {
-    promise = session.channel.appendRowWithWait(event.row, String(event.offset));
+    promise = producer.channel.appendRowWithWait(event.row, String(event.offset));
   } catch (error) {
     promise = Promise.reject(error);
   }
-  const item = { event, generation: session.generation, result: null };
-  item.outcome = support.observe(promise).then((result) => { item.result = result; return result; });
+  const item = { event, generation: producer.generation, result: null };
+  item.outcome = Promise.resolve(promise)
+    .then(() => ({ ok: true }), (error) => ({ error }))
+    .then((result) => {
+      item.result = result;
+      return result;
+    });
   return item;
 }
 
-async function checkpoint(session, pending, source, deadline) {
+async function confirmCheckpoint(producer, pending, source, deadline) {
   for (let item of pending) {
     let retries = 0;
     while (true) {
-      const result = await support.poll(item.outcome, Math.min(support.POLL_MS, support.remaining(deadline)));
+      const result = await poll(item.outcome, Math.min(POLL_MS, remaining(deadline)));
       if (result.waiting) continue;
       if (result.ok) break;
-      if (!support.retryable(result.error) || retries >= support.MAX_ATTEMPTS - 1) throw result.error;
-      if (support.INVALIDATION.has(result.error.errorCode)) await session.recover(item.generation);
+      if (!retryable(result.error) || retries >= MAX_ATTEMPTS - 1) throw result.error;
+      if (INVALIDATION.has(result.error.errorCode)) await producer.recover(item.generation);
       console.warn(`Retry EVENT_ID=${item.event.offset} after SDK failure; duplicates possible`);
-      await support.backoff(retries++, deadline);
-      item = submit(session, item.event);
+      await backoff(retries++, deadline);
+      item = appendEvent(producer, item.event);
     }
   }
   if (pending.length) {
+    // Retire the source window only after every append acknowledgement succeeds.
     source.acknowledge(pending[pending.length - 1].event.offset);
     pending.length = 0;
   }
 }
 
-async function run(session, source) {
+async function run(producer, source) {
   const pending = [];
-  let checkpointAt = performance.now() + support.CHECKPOINT_MS;
-  let deadline = performance.now() + support.OUTAGE_MS;
+  let checkpointAt = performance.now() + CHECKPOINT_MS;
+  let deadline = performance.now() + OUTAGE_MS;
   while (true) {
     const event = source.read();
     if (event === null) break;
-    const item = submit(session, event);
+    const item = appendEvent(producer, event);
     pending.push(item);
     await Promise.resolve();
-    if (pending.some((entry) => entry.result?.error) || pending.length >= support.CHECKPOINT_ROWS
+    if (pending.some((entry) => entry.result?.error) || pending.length >= CHECKPOINT_ROWS
         || performance.now() >= checkpointAt) {
-      await checkpoint(session, pending, source, deadline);
-      checkpointAt = performance.now() + support.CHECKPOINT_MS;
-      deadline = performance.now() + support.OUTAGE_MS;
+      await confirmCheckpoint(producer, pending, source, deadline);
+      checkpointAt = performance.now() + CHECKPOINT_MS;
+      deadline = performance.now() + OUTAGE_MS;
     }
   }
-  await checkpoint(session, pending, source, deadline);
+  await confirmCheckpoint(producer, pending, source, deadline);
 }
 
 async function main() {
-  const source = support.sourceFromEnv();
-  const session = new ElasticSession();
+  const source = new ReplaySource(Number(process.env.SNOWFLAKE_TEST_ROWS || 10_000),
+    Number(process.env.SNOWFLAKE_SOURCE_CHECKPOINT || 0));
+  const producer = new ElasticProducer();
   let completed = false;
   try {
-    await session.open();
-    await run(session, source);
+    await producer.open();
+    await run(producer, source);
     completed = true;
     console.log(`Durable source checkpoint: ${source.committed}; materialization is separate`);
   } finally {
     if (!completed) console.error(`Stopped. Retain events after checkpoint ${source.committed} for replay`);
-    await session.close(completed);
+    await producer.close(completed);
   }
 }
 
@@ -115,4 +211,4 @@ if (require.main === module) {
     .finally(() => clearInterval(keepAlive));
 }
 
-module.exports = { ElasticSession, submit, checkpoint, run, main };
+module.exports = { ReplaySource, retryable, remaining, backoff, createClient, CHECKPOINT_ROWS, MAX_ATTEMPTS, poll,  ElasticProducer, appendEvent, confirmCheckpoint, run, main };

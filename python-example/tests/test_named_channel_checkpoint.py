@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import named_channel_checkpoint_example as named
-import production_support as support
+support = named
 from snowflake.ingest.streaming import StreamingIngestError, StreamingIngestErrorCode
 
 
@@ -136,7 +136,7 @@ def test_permanent_failure_preserves_checkpoint():
 def test_expired_checkpoint_does_not_advance():
     source = support.ReplaySource(3)
     with pytest.raises(TimeoutError):
-        named.checkpoint(Session(), 3, source, support.time.monotonic() - 1)
+        named.confirm_checkpoint(Session(), 3, source, support.time.monotonic() - 1)
     assert source.committed == 0
 
 

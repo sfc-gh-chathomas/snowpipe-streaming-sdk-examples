@@ -5,8 +5,17 @@ import com.snowflake.ingest.streaming.OpenChannelResult;
 import com.snowflake.ingest.streaming.SFException;
 import com.snowflake.ingest.streaming.SnowflakeStreamingIngestClient;
 import com.snowflake.ingest.streaming.SnowflakeStreamingIngestChannel;
-import java.time.Duration;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.snowflake.ingest.streaming.SnowflakeStreamingIngestClientFactory;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.time.Duration;
 
 /**
  * Single-writer named-channel producer. Stream rows immediately and retain source
@@ -14,15 +23,113 @@ import java.util.concurrent.TimeUnit;
  * SDK invalidation reopens. Do not share ownership of the same channel.
  */
 public class NamedChannelCheckpoint {
-    static final String CHANNEL_NAME = ProductionSupport.env("SNOWFLAKE_CHANNEL", "production-source-0");
+    static final int CHECKPOINT_ROWS = 1000;
+    static final long CHECKPOINT_NANOS = TimeUnit.SECONDS.toNanos(5);
+    static final long OUTAGE_NANOS = TimeUnit.MINUTES.toNanos(5);
+    static final int MAX_ATTEMPTS = 6;
+
+    static boolean invalidation(SFException error) {
+        String code = error.getErrorCodeName();
+        return "InvalidChannelError".equals(code) || "InvalidClientError".equals(code)
+                || "ClosedChannelError".equals(code)
+                || "ClosedElasticChannelError".equals(code) || "ClosedClientError".equals(code);
+    }
+
+    static boolean retryable(SFException error) {
+        int status = error.getHttpStatusCode();
+        return invalidation(error) || status == 408 || status == 429
+                || status == 500 || status == 502 || status == 503 || status == 504;
+    }
+
+    static long remaining(long deadline) throws TimeoutException {
+        long nanos = deadline - System.nanoTime();
+        if (nanos <= 0) {
+            throw new TimeoutException("Outage deadline exceeded; retain events after source checkpoint for replay");
+        }
+        return nanos;
+    }
+
+    static void backoff(int attempt, long deadline) throws Exception {
+        long cap = Math.min(10000, 250L << Math.min(attempt, 6));
+        long delay = TimeUnit.MILLISECONDS.toNanos(ThreadLocalRandom.current().nextLong(cap + 1));
+        TimeUnit.NANOSECONDS.sleep(Math.min(delay, remaining(deadline)));
+    }
+
+    static String env(String name, String fallback) {
+        String value = System.getenv(name);
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    static SnowflakeStreamingIngestClient createClient() throws Exception {
+        Properties properties = new Properties();
+        String pat = System.getenv("SNOWFLAKE_PAT");
+        if (pat != null && !pat.isBlank()) {
+            String account = System.getenv("SNOWFLAKE_ACCOUNT");
+            String url = System.getenv("SNOWFLAKE_URL");
+            if (account == null || url == null) {
+                throw new IllegalArgumentException("PAT mode requires SNOWFLAKE_ACCOUNT and SNOWFLAKE_URL");
+            }
+            properties.put("authorization_type", "PAT");
+            properties.put("personal_access_token", pat);
+            properties.put("account", account);
+            properties.put("url", url);
+            if (System.getenv("SNOWFLAKE_ROLE") != null) {
+                properties.put("role", System.getenv("SNOWFLAKE_ROLE"));
+            }
+        } else {
+            JsonNode profile = new ObjectMapper().readTree(Files.readAllBytes(
+                    Paths.get(env("SNOWFLAKE_PROFILE", "profile.json"))));
+            profile.fields().forEachRemaining(entry -> properties.put(entry.getKey(), entry.getValue().asText()));
+        }
+        return SnowflakeStreamingIngestClientFactory.tableBuilder(
+                "production-" + ProcessHandle.current().pid(), env("SNOWFLAKE_DATABASE", "MY_DATABASE"),
+                env("SNOWFLAKE_SCHEMA", "MY_SCHEMA"), env("SNOWFLAKE_TABLE", "MY_TABLE"))
+                .setProperties(properties).build();
+    }
+
+    static class Event {
+        final long offset;
+        final Map<String, Object> row;
+        Event(long offset) {
+            this.offset = offset;
+            this.row = Map.of("EVENT_ID", offset, "C1", offset, "C2", "event-" + offset);
+        }
+    }
+
+    /** Deterministic replay fixture; its source checkpoint is not persisted. */
+    static class ReplaySource {
+        final long total;
+        long committed;
+        long nextOffset;
+        ReplaySource(long total, long checkpoint) {
+            if (checkpoint < 0 || checkpoint > total) throw new IllegalArgumentException("Invalid checkpoint");
+            this.total = total;
+            this.committed = checkpoint;
+            this.nextOffset = checkpoint + 1;
+        }
+        Event read() { return nextOffset > total ? null : new Event(nextOffset++); }
+        void acknowledge(long offset) {
+            if (offset < committed || offset > total) throw new IllegalArgumentException("Invalid checkpoint");
+            committed = offset;
+        }
+        void seek(long offset) {
+            acknowledge(offset);
+            nextOffset = offset + 1;
+        }
+    }
+
+
+    interface ClientFactory { SnowflakeStreamingIngestClient create() throws Exception; }
+
+    static final String CHANNEL_NAME = env("SNOWFLAKE_CHANNEL", "production-source-0");
 
     static long parseOffset(String token) { return token == null ? 0 : Long.parseLong(token); }
 
-    static class Session {
-        final ProductionSupport.ClientFactory factory;
+    static class Producer {
+        final ClientFactory factory;
         SnowflakeStreamingIngestClient client;
         SnowflakeStreamingIngestChannel channel;
-        Session(ProductionSupport.ClientFactory factory) { this.factory = factory; }
+        Producer(ClientFactory factory) { this.factory = factory; }
         long open() throws Exception {
             if (client == null) client = factory.create();
             OpenChannelResult opened = client.openChannel(CHANNEL_NAME);
@@ -61,12 +168,12 @@ public class NamedChannelCheckpoint {
         }
     }
 
-    static void checkpoint(Session session, long target, ProductionSupport.ReplaySource source,
+    static void confirmCheckpoint(Producer producer, long target, ReplaySource source,
                            long deadline) throws Exception {
         while (true) {
-            ProductionSupport.remaining(deadline);
+            remaining(deadline);
             try {
-                ChannelStatus status = session.channel.getChannelStatus();
+                ChannelStatus status = producer.channel.getChannelStatus();
                 if (status.getRowsErrorCount() > 0) throw new IllegalStateException("Reconcile row errors before handoff");
                 if (!"SUCCESS".equals(status.getStatusCode())) {
                     throw new SFException("InvalidChannelError", status.getStatusCode(), 409, "Conflict");
@@ -76,63 +183,66 @@ public class NamedChannelCheckpoint {
                     return;
                 }
             } catch (SFException error) {
-                if (ProductionSupport.invalidation(error) || !ProductionSupport.retryable(error)) throw error;
+                if (invalidation(error) || !retryable(error)) throw error;
             }
-            ProductionSupport.backoff(2, deadline);
+            backoff(2, deadline);
         }
     }
 
-    static void run(Session session, ProductionSupport.ReplaySource source) throws Exception {
-        source.seek(session.open());
-        long submitted = source.committed;
-        int outstanding = 0;
-        int failures = 0;
-        ProductionSupport.Event event = null;
-        long deadline = System.nanoTime() + ProductionSupport.OUTAGE_NANOS;
-        long checkpointAt = System.nanoTime() + ProductionSupport.CHECKPOINT_NANOS;
+    static void run(Producer producer, ReplaySource source) throws Exception {
+        // The server checkpoint is authoritative when restarting this source.
+        source.seek(producer.open());
+        long lastSubmittedOffset = source.committed;
+        int uncommittedCount = 0;
+        int retryAttempts = 0;
+        Event event = null;
+        long deadline = System.nanoTime() + OUTAGE_NANOS;
+        long checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
         while (true) {
             try {
                 if (event == null) event = source.read();
                 if (event == null) {
-                    if (outstanding > 0) checkpoint(session, submitted, source, deadline);
+                    if (uncommittedCount > 0) confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
                     return;
                 }
-                ProductionSupport.remaining(deadline);
-                session.channel.appendRow(event.row, String.valueOf(event.offset));
-                submitted = event.offset;
+                remaining(deadline);
+                producer.channel.appendRow(event.row, String.valueOf(event.offset));
+                lastSubmittedOffset = event.offset;
                 event = null;
-                outstanding++;
-                if (outstanding >= ProductionSupport.CHECKPOINT_ROWS || System.nanoTime() >= checkpointAt) {
-                    checkpoint(session, submitted, source, deadline);
-                    outstanding = 0;
-                    failures = 0;
-                    deadline = System.nanoTime() + ProductionSupport.OUTAGE_NANOS;
-                    checkpointAt = System.nanoTime() + ProductionSupport.CHECKPOINT_NANOS;
+                uncommittedCount++;
+                if (uncommittedCount >= CHECKPOINT_ROWS || System.nanoTime() >= checkpointAt) {
+                    confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
+                    uncommittedCount = 0;
+                    retryAttempts = 0;
+                    deadline = System.nanoTime() + OUTAGE_NANOS;
+                    checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
                 }
             } catch (SFException error) {
-                if (!ProductionSupport.retryable(error) || ++failures >= ProductionSupport.MAX_ATTEMPTS) throw error;
-                if (ProductionSupport.invalidation(error)) {
-                    source.seek(session.recover(error));
-                    submitted = source.committed;
-                    outstanding = 0;
+                if (!retryable(error) || ++retryAttempts >= MAX_ATTEMPTS) throw error;
+                if (invalidation(error)) {
+                    source.seek(producer.recover(error));
+                    lastSubmittedOffset = source.committed;
+                    uncommittedCount = 0;
                     event = null;
                 }
-                ProductionSupport.backoff(failures - 1, deadline);
+                backoff(retryAttempts - 1, deadline);
             }
         }
     }
 
     public static void main(String[] args) throws Exception {
-        ProductionSupport.ReplaySource source = ProductionSupport.sourceFromEnv();
-        Session session = new Session(ProductionSupport::createClient);
+        ReplaySource source = new ReplaySource(
+                Long.parseLong(env("SNOWFLAKE_TEST_ROWS", "10000")),
+                Long.parseLong(env("SNOWFLAKE_SOURCE_CHECKPOINT", "0")));
+        Producer producer = new Producer(NamedChannelCheckpoint::createClient);
         boolean completed = false;
         try {
-            run(session, source);
+            run(producer, source);
             completed = true;
             System.out.println("Committed source checkpoint: " + source.committed);
         } finally {
             if (!completed) System.err.println("Retain source events after checkpoint " + source.committed);
-            session.close(completed);
+            producer.close(completed);
         }
     }
 }

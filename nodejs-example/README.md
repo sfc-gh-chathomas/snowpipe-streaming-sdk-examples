@@ -105,7 +105,7 @@ cannot cause an unhandled rejection. Count/time checkpoints pause intake and wai
 Promise. A caller timeout neither cancels nor resubmits it. Only terminal retryable SDK failures are
 resubmitted; only SDK invalidation recreates the client. Old-generation failures reuse the new client.
 
-Both production programs use `production_support.js`. The included `ReplaySource` regenerates fixed
+Both production programs are self-contained. The included `ReplaySource` regenerates fixed
 events and does not persist checkpoints. Replace it with the producer's retained source API.
 PAT mode requires `SNOWFLAKE_PAT`, `SNOWFLAKE_ACCOUNT`, and `SNOWFLAKE_URL`; `SNOWFLAKE_ROLE` is optional.
 Otherwise `profile.json` or `SNOWFLAKE_PROFILE` is used. Account/role defaults are not hard-coded for tests.

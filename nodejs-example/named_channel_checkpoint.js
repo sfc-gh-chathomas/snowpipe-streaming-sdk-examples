@@ -5,8 +5,83 @@
  */
 "use strict";
 
-const support = require("./production_support.js");
-const { StreamingIngestError } = require("snowpipe-streaming");
+const { createTableClient, StreamingIngestError } = require("snowpipe-streaming");
+
+const CHECKPOINT_ROWS = 1_000;
+const CHECKPOINT_MS = 5_000;
+const OUTAGE_MS = 300_000;
+const POLL_MS = 1_000;
+const MAX_ATTEMPTS = 6;
+const INVALIDATION = new Set([
+  "InvalidChannelError", "InvalidClientError", "ClosedChannelError",
+  "ClosedElasticChannelError", "ClosedClientError",
+]);
+
+function retryable(error) {
+  return error instanceof StreamingIngestError &&
+    (INVALIDATION.has(error.errorCode) || [408, 429, 500, 502, 503, 504].includes(error.httpStatusCode));
+}
+
+function remaining(deadline) {
+  const millis = deadline - performance.now();
+  if (millis <= 0) {
+    throw new Error("Outage deadline exceeded; source checkpoint unchanged; retain events for replay");
+  }
+  return millis;
+}
+
+async function backoff(attempt, deadline) {
+  const delay = Math.min(remaining(deadline), Math.random() * Math.min(10_000, 250 * 2 ** Math.min(attempt, 6)));
+  await new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+async function createClient() {
+  let authentication = { profilePath: process.env.SNOWFLAKE_PROFILE || "profile.json" };
+  if (process.env.SNOWFLAKE_PAT) {
+    if (!process.env.SNOWFLAKE_ACCOUNT || !process.env.SNOWFLAKE_URL) {
+      throw new Error("PAT mode requires SNOWFLAKE_ACCOUNT and SNOWFLAKE_URL");
+    }
+    authentication = { properties: {
+      authorization_type: "PAT",
+      personal_access_token: process.env.SNOWFLAKE_PAT,
+      account: process.env.SNOWFLAKE_ACCOUNT,
+      url: process.env.SNOWFLAKE_URL,
+      ...(process.env.SNOWFLAKE_ROLE ? { role: process.env.SNOWFLAKE_ROLE } : {}),
+    } };
+  }
+  return createTableClient({
+    clientName: `production-${process.pid}`,
+    dbName: process.env.SNOWFLAKE_DATABASE || "MY_DATABASE",
+    schemaName: process.env.SNOWFLAKE_SCHEMA || "MY_SCHEMA",
+    tableName: process.env.SNOWFLAKE_TABLE || "MY_TABLE",
+    ...authentication,
+  });
+}
+
+// Regenerable sample data only; a real source must retain events across restarts.
+class ReplaySource {
+  constructor(total = 10_000, checkpoint = 0) {
+    if (!Number.isSafeInteger(total) || !Number.isSafeInteger(checkpoint) || checkpoint < 0 || checkpoint > total) {
+      throw new Error("Require integer 0 <= source checkpoint <= total");
+    }
+    this.total = total;
+    this.committed = checkpoint;
+    this.nextOffset = checkpoint + 1;
+  }
+  read() {
+    if (this.nextOffset > this.total) return null;
+    const offset = this.nextOffset++;
+    return { offset, row: { EVENT_ID: offset, C1: offset, C2: `event-${offset}` } };
+  }
+  acknowledge(offset) {
+    if (offset < this.committed || offset > this.total) throw new Error("Invalid source checkpoint");
+    this.committed = offset;
+  }
+  seek(committed) {
+    this.acknowledge(committed);
+    this.nextOffset = committed + 1;
+  }
+}
 const CHANNEL = process.env.SNOWFLAKE_CHANNEL || "production-source-0";
 
 function parseOffset(token) {
@@ -16,8 +91,8 @@ function parseOffset(token) {
   return offset;
 }
 
-class NamedSession {
-  constructor(factory = support.createClient) {
+class NamedProducer {
+  constructor(factory = createClient) {
     this.factory = factory;
     this.client = null;
     this.channel = null;
@@ -54,11 +129,11 @@ class NamedSession {
   }
 }
 
-async function checkpoint(session, target, source, deadline) {
+async function confirmCheckpoint(producer, target, source, deadline) {
   while (true) {
-    support.remaining(deadline);
+    remaining(deadline);
     try {
-      const status = await session.channel.getChannelStatus();
+      const status = await producer.channel.getChannelStatus();
       if (status.rowsErrorCount) throw new Error("Reconcile row errors before source handoff");
       if (status.statusCode !== "SUCCESS") {
         throw new StreamingIngestError("InvalidChannelError", status.statusCode, 409, "Conflict");
@@ -68,63 +143,65 @@ async function checkpoint(session, target, source, deadline) {
         return;
       }
     } catch (error) {
-      if (support.INVALIDATION.has(error.errorCode) || !support.retryable(error)) throw error;
+      if (INVALIDATION.has(error.errorCode) || !retryable(error)) throw error;
     }
-    await support.backoff(2, deadline);
+    await backoff(2, deadline);
   }
 }
 
-async function run(session, source) {
-  source.seek(await session.open());
-  let submitted = source.committed;
-  let outstanding = 0;
-  let failures = 0;
+async function run(producer, source) {
+  // Resume after the server checkpoint, never after the last lastSubmittedOffset event.
+  source.seek(await producer.open());
+  let lastSubmittedOffset = source.committed;
+  let uncommittedCount = 0;
+  let retryAttempts = 0;
   let event = null;
-  let deadline = performance.now() + support.OUTAGE_MS;
-  let checkpointAt = performance.now() + support.CHECKPOINT_MS;
+  let deadline = performance.now() + OUTAGE_MS;
+  let checkpointAt = performance.now() + CHECKPOINT_MS;
   while (true) {
     try {
       if (event === null) event = source.read();
       if (event === null) {
-        if (outstanding) await checkpoint(session, submitted, source, deadline);
+        if (uncommittedCount) await confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
         return;
       }
-      support.remaining(deadline);
-      session.channel.appendRow(event.row, String(event.offset));
-      submitted = event.offset;
+      remaining(deadline);
+      producer.channel.appendRow(event.row, String(event.offset));
+      lastSubmittedOffset = event.offset;
       event = null;
-      outstanding++;
-      if (outstanding >= support.CHECKPOINT_ROWS || performance.now() >= checkpointAt) {
-        await checkpoint(session, submitted, source, deadline);
-        outstanding = 0;
-        failures = 0;
-        deadline = performance.now() + support.OUTAGE_MS;
-        checkpointAt = performance.now() + support.CHECKPOINT_MS;
+      uncommittedCount++;
+      if (uncommittedCount >= CHECKPOINT_ROWS || performance.now() >= checkpointAt) {
+        await confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
+        uncommittedCount = 0;
+        retryAttempts = 0;
+        deadline = performance.now() + OUTAGE_MS;
+        checkpointAt = performance.now() + CHECKPOINT_MS;
       }
     } catch (error) {
-      if (!support.retryable(error) || ++failures >= support.MAX_ATTEMPTS) throw error;
-      if (support.INVALIDATION.has(error.errorCode)) {
-        source.seek(await session.recover(error));
-        submitted = source.committed;
-        outstanding = 0;
+      if (!retryable(error) || ++retryAttempts >= MAX_ATTEMPTS) throw error;
+      if (INVALIDATION.has(error.errorCode)) {
+        source.seek(await producer.recover(error));
+        lastSubmittedOffset = source.committed;
+        uncommittedCount = 0;
         event = null;
       }
-      await support.backoff(failures - 1, deadline);
+      await backoff(retryAttempts - 1, deadline);
     }
   }
 }
 
 async function main() {
-  const source = support.sourceFromEnv();
-  const session = new NamedSession();
+  const source = new ReplaySource(Number(process.env.SNOWFLAKE_TEST_ROWS || 10_000),
+    Number(process.env.SNOWFLAKE_SOURCE_CHECKPOINT || 0));
+  const producer = new NamedProducer();
   let completed = false;
   try {
-    await run(session, source);
+    await run(producer, source);
     completed = true;
     console.log(`Committed source checkpoint: ${source.committed}`);
   } finally {
     if (!completed) console.error(`Stopped. Retain events after checkpoint ${source.committed} for replay`);
-    await session.close(completed);
+    await producer.close(completed);
   }
 }
 
@@ -134,4 +211,4 @@ if (require.main === module) {
     .finally(() => clearInterval(keepAlive));
 }
 
-module.exports = { NamedSession, parseOffset, checkpoint, run, main };
+module.exports = { ReplaySource, retryable, remaining, backoff, createClient, CHECKPOINT_ROWS, MAX_ATTEMPTS,  NamedProducer, parseOffset, confirmCheckpoint, run, main };

@@ -118,8 +118,8 @@ for each row before reading the next one. Polling timeouts pause intake without 
 invalidation recreates the client; a generation check prevents old failures from rebuilding it again.
 Only terminal retryable SDK errors are resubmitted, with explicit duplicate risk.
 
-`production_support.py` contains configuration, capped jittered backoff, and a deterministic
-`ReplaySource`. Its checkpoint is in-memory: replace it with the producer's retained source APIs.
+Each example includes its configuration, capped jittered backoff, and deterministic
+`ReplaySource` in the same file. Its checkpoint is in-memory: replace it with the producer's retained source APIs.
 PAT mode requires `SNOWFLAKE_PAT`, `SNOWFLAKE_ACCOUNT`, and `SNOWFLAKE_URL`; the optional
 `SNOWFLAKE_ROLE` has no administrative default. Otherwise `profile.json` or `SNOWFLAKE_PROFILE` is used.
 
