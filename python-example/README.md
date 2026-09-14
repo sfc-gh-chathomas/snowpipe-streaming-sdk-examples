@@ -1,13 +1,28 @@
-# Python Snowpipe Streaming SDK Example
+# Python Snowpipe Streaming SDK Examples
 
-This example demonstrates how to use the Snowflake Streaming Ingest SDK in Python to ingest data into Snowflake in real-time using the [high-performance architecture](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-overview) and default pipe.
+Examples for ingesting data into Snowflake with the [Snowpipe Streaming](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-overview) Python SDK.
+
+## Which example should I use?
+
+**Start with Elastic Channels.** They are the default starting point for a new streaming application: one channel per client, Snowflake manages the fan-out, and you never name, open, or close a channel yourself.
+
+| Example | Use it for |
+| --- | --- |
+| [`elastic_quickstart.py`](./elastic_quickstart.py) | Your first Elastic Channel. Append one row, wait for durability, inspect status, close. |
+| [`elastic_production_example.py`](./elastic_production_example.py) | Running Elastic Channels in production: individual row appends, bounded durability checkpoints, retry, recovery, and reconciliation. |
+| [`named_channel_checkpoint_example.py`](./named_channel_checkpoint_example.py) | Ordered, strict exactly-once ingestion driven by a replayable source offset (Kafka partition, CDC log sequence number, file offset). |
+| [`streaming_ingest_example.py`](./streaming_ingest_example.py) | The original single-file named-channel walkthrough. |
+| [`monitoring/`](./monitoring) | Monitoring channel status, tracking offset lag, and aborting on error increase. |
+
+Choose a named channel over an Elastic Channel when you need Snowflake to track a source offset for you so a restart resumes exactly where the last run committed. Otherwise prefer Elastic.
 
 ## Prerequisites
 
 - Python 3.9 or higher
-- pip (Python package manager)
+- pip
 - A Snowflake account with appropriate permissions
 - RSA key-pair authentication configured
+- `snowpipe-streaming` **1.8.0 or later** for the GA acknowledgement API used here
 
 ## Setup
 
@@ -26,36 +41,29 @@ ALTER USER MY_USER SET RSA_PUBLIC_KEY='<contents of rsa_key.pub, without header/
 
 ### 2. Create a Snowflake Table
 
-Create a target table in your Snowflake account:
-
 ```sql
 CREATE OR REPLACE TABLE MY_DATABASE.MY_SCHEMA.MY_TABLE (
+    DATA VARIANT,
+    EVENT_ID NUMBER,
     c1 NUMBER,
     c2 VARCHAR,
     ts TIMESTAMP_NTZ
 );
 ```
 
-No `CREATE PIPE` is needed — the high-performance architecture automatically creates a **default pipe** named `MY_TABLE-STREAMING` when you first open a channel.
+No `CREATE PIPE` is needed. Snowflake automatically creates a **default pipe** named `MY_TABLE-STREAMING` when you first use the table for streaming.
 
 ### 3. Install Dependencies
-
-Create and activate a virtual environment (recommended):
 
 ```bash
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-Install the required packages:
-
-```bash
 pip install -r requirements.txt
 ```
 
 ### 4. Configure Authentication
 
-Create a `profile.json` file in the `python-example` directory using `profile.json.example` as a template:
+Create a `profile.json` file in this directory using `profile.json.example` as a template:
 
 ```json
 {
@@ -67,73 +75,102 @@ Create a `profile.json` file in the `python-example` directory using `profile.js
 }
 ```
 
-**Note:** Use `private_key_file` to reference the key file path. For production, consider using a secure credential manager.
+**Note:** Use `private_key_file` to reference the key file path. For production, use a secure credential manager.
 
 ### 5. Update Configuration
 
-Edit `streaming_ingest_example.py` and update the constants at the top of the file:
-
-- `DATABASE` - Your database name
-- `SCHEMA` - Your schema name
-- `TABLE` - Your table name (the pipe name is derived automatically as `<TABLE>-STREAMING`)
+Edit the object-name defaults or set the matching `SNOWFLAKE_*` environment variables. The pipe name is derived as `<TABLE>-STREAMING`.
 
 ## Run
 
 ```bash
-python streaming_ingest_example.py
+python elastic_quickstart.py
+python elastic_production_example.py
+python named_channel_checkpoint_example.py
 ```
 
-## What the Example Does
+## Elastic Channels
 
-1. **Creates a Streaming Ingest Client** - Connects to Snowflake using credentials from `profile.json`
-2. **Opens a Channel** - Creates a channel on the default pipe (`MY_TABLE-STREAMING`)
-3. **Ingests Data** - Streams 100,000 rows with columns matched by name (MATCH_BY_COLUMN_NAME):
-   - `c1`: Integer counter
-   - `c2`: String representation of the counter
-   - `ts`: Current timestamp
-4. **Waits for Completion** - Uses `wait_for_commit()` to block until all rows are committed, then calls `get_channel_status()` to display committed offset, rows inserted, error count, and server latency
-5. **Closes Resources** - Properly closes the channel and client via context managers
+### Quickstart
 
-## Expected Output
+`elastic_quickstart.py` is the minimal path:
 
-```
-Client created successfully
-Channel opened: MY_CHANNEL_<uuid>
-Ingesting 100000 rows...
-Ingested 10000 rows...
-Ingested 20000 rows...
-...
-All rows submitted. Waiting for commit...
-All data committed. Channel status:
-  Committed offset:   100000
-  Rows inserted:      100000
-  Rows errored:       0
-  Avg server latency: 1.234 s
-Data ingestion completed
+1. `StreamingIngestClient.from_table(...)` creates a table-mode client against the default pipe.
+2. `client.get_elastic_channel()` returns the channel. It is a **cached singleton per client**: calling it again hands back the same channel.
+3. `channel.append_row_with_wait(row, append_token)` returns a `Future` that completes on durable acknowledgement.
+4. `client.close(wait_for_flush=True, timeout_seconds=60)` flushes and tears down. Elastic Channels have no `close()` of their own; their lifecycle is tied to the client.
+
+The second argument to every append is an **append token**: an opaque id you choose, echoed back to you on success or failure so you can tie an outcome to your own data. Tokens stay in SDK memory until acknowledgement, so keep them small.
+
+### Append variants
+
+| Call | Returns | Use when |
+| --- | --- | --- |
+| `append_row` / `append_rows` | nothing | Fire-and-forget. The success and error handlers are your **only** signal. |
+| `append_row_with_wait` / `append_rows_with_wait` | `Future` | You need to know a specific batch became durable. This is the correctness path. |
+
+### Production concerns
+
+See the [shared retention contract](../README.md#production-retention-contract).
+`elastic_production_example.py` submits each event immediately with `append_row_with_wait`, then
+waits on the original Futures at a bounded count/time checkpoint. It does not batch payloads or wait
+for each row before reading the next one. Polling timeouts pause intake without resubmission. SDK
+invalidation recreates the client; a generation check prevents old failures from rebuilding it again.
+Only terminal retryable SDK errors are resubmitted, with explicit duplicate risk.
+
+`production_support.py` contains configuration, capped jittered backoff, and a deterministic
+`ReplaySource`. Its checkpoint is in-memory: replace it with the producer's retained source APIs.
+PAT mode requires `SNOWFLAKE_PAT`, `SNOWFLAKE_ACCOUNT`, and `SNOWFLAKE_URL`; the optional
+`SNOWFLAKE_ROLE` has no administrative default. Otherwise `profile.json` or `SNOWFLAKE_PROFILE` is used.
+
+## Named channels
+
+`named_channel_checkpoint_example.py` shows the asynchronous checkpoint pattern:
+
+1. Open a stable, exclusively owned channel without replacing its server offset, then seek the source after the returned committed offset.
+2. Append individual rows with source-offset tokens; SDK buffering handles transport batching.
+3. At a bounded count/time checkpoint or end of input, wait for committed progress and check row errors before handing off source progress.
+4. Retry local backpressure on the same event. On SDK invalidation, reopen and seek again; client invalidation requires a new client.
+
+Offset tokens are opaque to Snowflake; this fixture encodes numeric offsets as strings and compares
+them numerically. No lexical ordering assumption or server-side deduplication by arbitrary token value
+is made. The source adapter is responsible for replay positioning.
+
+## Tests
+
+The tests drive the actual loops with SDK-shaped failures: immediate submission, paused intake,
+late success, shared outage deadlines, partial acknowledgements, backpressure, invalidation, and restart seek.
+
+```bash
+pip install -r requirements.txt pytest
+python -m pytest tests -v
 ```
 
 ## Logging
 
-Adjust the logging level with the `SS_LOG_LEVEL` environment variable:
-
 ```bash
 export SS_LOG_LEVEL=info    # More detailed logs
 export SS_LOG_LEVEL=debug   # Debug logs
-python streaming_ingest_example.py
 ```
 
-The script defaults to `warn` to reduce output noise.
+The examples default to `warn` to reduce output noise.
 
 ## Troubleshooting
 
 - **Connection Issues**: Verify your `profile.json` credentials and network connectivity to Snowflake
 - **Permission Errors**: Ensure your role has the necessary privileges on the database, schema, and table
-- **Table Not Found**: Verify the table exists — the default pipe is created automatically
-- **VARIANT Columns**: If using VARIANT columns, pass data as a Python `dict`, not a JSON string
-- **Import Errors**: Make sure you've installed all dependencies with `pip install -r requirements.txt`
+- **Table Not Found**: Verify the table exists; the default pipe is created automatically
+- **`get_elastic_channel()` returns a closed channel**: The client is invalidated. Create a new client — re-getting the channel on the same client returns the same channel
+- **Appends failing with 429**: You are appending faster than Snowflake is acknowledging. Lower your in-flight bound and back off; see `elastic_production_example.py`
+- **`wait_for_commit` never returns**: Your predicate is probably an equality check. Snowflake commits in batches, so use `>=`
+- **VARIANT Columns**: Pass data as a Python `dict`, not a JSON string
+- **Import Errors**: Install dependencies with `pip install -r requirements.txt`, and confirm `snowpipe-streaming>=1.8.0`
 
 ## Additional Resources
 
+- [Elastic Channels overview](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-elastic-channels-overview)
+- [Elastic Channels getting started](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-elastic-channels-getting-started)
+- [Elastic Channels best practices](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-elastic-channels-best-practices)
+- [Elastic Channels error handling](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-elastic-channels-error-handling)
 - [High-Performance Streaming Overview](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-overview)
-- [Getting Started Guide](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-getting-started)
 - [Snowpipe Streaming SDK on PyPI](https://pypi.org/project/snowpipe-streaming/)
