@@ -19,6 +19,7 @@ const INVALIDATION = new Set([
 
 // Start here: source, connection, then the streaming loop.
 
+// Run the sample and close the client, retaining unconfirmed source work on failure.
 async function main() {
   const source = new SampleEventSource(Number(process.env.SNOWFLAKE_TEST_ROWS || 10_000),
     Number(process.env.SNOWFLAKE_SOURCE_CHECKPOINT || 0));
@@ -34,6 +35,7 @@ async function main() {
   }
 }
 
+// Stream retained events and pause intake at delivery checkpoints.
 async function run(producer, source) {
   // Resume after the server checkpoint, never after the last submitted event.
   source.seek(await producer.open());
@@ -78,11 +80,13 @@ async function run(producer, source) {
 
 // Supporting delivery and connection details.
 
+// Identify SDK failures eligible for bounded application retry.
 function retryable(error) {
   return error instanceof StreamingIngestError &&
     (INVALIDATION.has(error.errorCode) || [408, 429, 500, 502, 503, 504].includes(error.httpStatusCode));
 }
 
+// Return the remaining checkpoint budget, or stop without advancing source progress.
 function remaining(deadline) {
   const millis = deadline - performance.now();
   if (millis <= 0) {
@@ -91,11 +95,13 @@ function remaining(deadline) {
   return millis;
 }
 
+// Wait with capped jitter without exceeding the remaining checkpoint budget.
 async function backoff(attempt, deadline) {
   const delay = Math.min(remaining(deadline), Math.random() * Math.min(10_000, 250 * 2 ** Math.min(attempt, 6)));
   await new Promise((resolve) => setTimeout(resolve, delay));
 }
 
+// Create a table client using the authentication profile or explicitly configured PAT.
 async function createClient() {
   let authentication = { profilePath: process.env.SNOWFLAKE_PROFILE || "profile.json" };
   if (process.env.SNOWFLAKE_PAT) {
@@ -129,17 +135,20 @@ class SampleEventSource {
     this.committed = checkpoint;
     this.nextOffset = checkpoint + 1;
   }
+  // Return the next sample event without acknowledging source progress.
   read() {
     if (this.nextOffset > this.total) return null;
     const offset = this.nextOffset++;
     // Replace this mapping with your target columns and stable event ID.
     return { offset, row: { EVENT_ID: offset, C1: offset, C2: `event-${offset}` } };
   }
+  // Record confirmed progress; replace with your source's durable commit operation.
   acknowledge(offset) {
     // Persist/commit source progress here before retiring real source events.
     if (offset < this.committed || offset > this.total) throw new Error("Invalid source checkpoint");
     this.committed = offset;
   }
+  // Resume sample reads after confirmed progress; replace with your source seek operation.
   seek(committed) {
     this.acknowledge(committed);
     this.nextOffset = committed + 1;
@@ -147,6 +156,7 @@ class SampleEventSource {
 }
 const CHANNEL = process.env.SNOWFLAKE_CHANNEL || "production-source-0";
 
+// Decode this sample's numeric source offset; an absent token means no progress.
 function parseOffset(token) {
   if (token == null) return 0;
   const offset = Number(token);
@@ -154,12 +164,14 @@ function parseOffset(token) {
   return offset;
 }
 
+// Own one stable named channel and preserve server progress during recovery.
 class NamedProducer {
   constructor(factory = createClient) {
     this.factory = factory;
     this.client = null;
     this.channel = null;
   }
+  // Open the owned named channel and return its authoritative committed source offset.
   async open() {
     if (!this.client) this.client = await this.factory();
     const opened = await this.client.openChannel({ name: CHANNEL });
@@ -167,6 +179,7 @@ class NamedProducer {
     if (opened.status.rowsErrorCount) throw new Error("Reconcile row errors before source handoff");
     return parseOffset(opened.status.latestCommittedOffsetToken);
   }
+  // Reopen without resetting the server offset, recreating an invalid client if needed.
   async recover(error) {
     if (error.errorCode === "InvalidClientError") {
       await this.close(false);
@@ -181,6 +194,7 @@ class NamedProducer {
       return this.open();
     }
   }
+  // Close the current client; flush only when requested by the caller.
   async close(flush) {
     if (this.client) {
       try {
@@ -192,6 +206,7 @@ class NamedProducer {
   }
 }
 
+// Confirm committed progress and row health before acknowledging the source.
 async function confirmCheckpoint(producer, target, source, deadline) {
   while (true) {
     remaining(deadline);

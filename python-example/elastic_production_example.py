@@ -27,6 +27,7 @@ TRANSIENT = {408, 429, 500, 502, 503, 504}
 # Start here: create a source, connect, and stream retained events.
 
 def main():
+    """Run the sample and close the client, retaining unconfirmed source work on failure."""
     source = SampleEventSource(
         int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000")),
         int(os.environ.get("SNOWFLAKE_SOURCE_CHECKPOINT", "0")),
@@ -46,6 +47,7 @@ def main():
 
 
 def run(producer, source):
+    """Stream retained events and pause intake at delivery checkpoints."""
     pending = []
     checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
     deadline = time.monotonic() + OUTAGE_SECONDS
@@ -67,12 +69,14 @@ def run(producer, source):
 # Supporting delivery and connection details.
 
 def retryable(error):
+    """Identify SDK failures eligible for bounded application retry."""
     return isinstance(error, StreamingIngestError) and (
         error.error_code.value in INVALIDATION or error.http_status_code in TRANSIENT
     )
 
 
 def remaining(deadline):
+    """Return the remaining checkpoint budget, or stop without advancing source progress."""
     seconds = deadline - time.monotonic()
     if seconds <= 0:
         raise TimeoutError("Outage deadline exceeded; source checkpoint unchanged; retain events for replay")
@@ -80,11 +84,13 @@ def remaining(deadline):
 
 
 def backoff(attempt, deadline):
+    """Wait with capped jitter without exceeding the remaining checkpoint budget."""
     delay = random.uniform(0, min(10.0, 0.25 * 2 ** min(attempt, 6)))
     time.sleep(min(delay, remaining(deadline)))
 
 
 def create_client():
+    """Create a table client using the authentication profile or explicitly configured PAT."""
     properties = None
     if os.environ.get("SNOWFLAKE_PAT"):
         properties = {
@@ -119,6 +125,7 @@ class SampleEventSource:
         self.next_offset = checkpoint + 1
 
     def read(self):
+        """Return the next sample event without acknowledging source progress."""
         # Replace this deterministic fixture with reads from your retained source.
         if self.next_offset > self.total:
             return None
@@ -129,12 +136,14 @@ class SampleEventSource:
         return offset, row
 
     def acknowledge(self, offset):
+        """Record confirmed progress; replace with your source's durable commit operation."""
         # In production, persist/commit source progress here before retiring events.
         if not self.committed <= offset <= self.total:
             raise ValueError("Invalid source checkpoint")
         self.committed = offset
 
     def seek(self, committed):
+        """Resume sample reads after confirmed progress; replace with your source seek operation."""
         # Position the retained source strictly after Snowflake committed progress.
         self.acknowledge(committed)
         self.next_offset = committed + 1
@@ -142,6 +151,7 @@ class SampleEventSource:
 
 @dataclass
 class Pending:
+    """Track an event, its acknowledgement, and the client generation that submitted it."""
     event: tuple
     future: object
     generation: int
@@ -155,6 +165,7 @@ class ElasticProducer:
         self.generation = 0
 
     def open(self):
+        """Create a client and obtain its cached Elastic Channel."""
         client = self.factory()
         try:
             self.channel = client.get_elastic_channel()
@@ -165,6 +176,7 @@ class ElasticProducer:
         self.generation += 1
 
     def recover(self, generation):
+        """Replace the invalid client only if the failure belongs to its current generation."""
         # Several pending appends can fail from the same old client. Replace it once.
         if generation != self.generation:
             return
@@ -172,6 +184,7 @@ class ElasticProducer:
         self.open()
 
     def close(self, flush):
+        """Close the current client; flush only when requested by the caller."""
         if self.client is not None:
             try:
                 self.client.close(wait_for_flush=flush, timeout_seconds=30)
@@ -180,6 +193,7 @@ class ElasticProducer:
 
 
 def append_event(producer, event, deadline):
+    """Submit one event with bounded retry and retain its original acknowledgement Future."""
     for attempt in range(MAX_ATTEMPTS):
         remaining(deadline)
         try:
@@ -197,6 +211,7 @@ def append_event(producer, event, deadline):
 
 
 def confirm_checkpoint(producer, pending, source, deadline):
+    """Confirm every pending append before advancing the source checkpoint."""
     for item in pending:
         retries = 0
         while True:

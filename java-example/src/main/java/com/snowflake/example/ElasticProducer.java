@@ -48,6 +48,7 @@ public class ElasticProducer {
         }
     }
 
+    /** Stream retained events and pause intake at delivery checkpoints. */
     static void run(Producer producer, SampleEventSource source) throws Exception {
         List<Pending> pending = new ArrayList<>();
         long checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
@@ -75,12 +76,14 @@ public class ElasticProducer {
                 || "ClosedElasticChannelError".equals(code) || "ClosedClientError".equals(code);
     }
 
+    /** Identify SDK failures eligible for bounded application retry. */
     static boolean retryable(SFException error) {
         int status = error.getHttpStatusCode();
         return invalidation(error) || status == 408 || status == 429
                 || status == 500 || status == 502 || status == 503 || status == 504;
     }
 
+    /** Return the remaining checkpoint budget, or stop without advancing source progress. */
     static long remaining(long deadline) throws TimeoutException {
         long nanos = deadline - System.nanoTime();
         if (nanos <= 0) {
@@ -89,17 +92,20 @@ public class ElasticProducer {
         return nanos;
     }
 
+    /** Wait with capped jitter without exceeding the remaining checkpoint budget. */
     static void backoff(int attempt, long deadline) throws Exception {
         long cap = Math.min(10000, 250L << Math.min(attempt, 6));
         long delay = TimeUnit.MILLISECONDS.toNanos(ThreadLocalRandom.current().nextLong(cap + 1));
         TimeUnit.NANOSECONDS.sleep(Math.min(delay, remaining(deadline)));
     }
 
+    /** Read an optional setting, using the fallback for missing or blank values. */
     static String env(String name, String fallback) {
         String value = System.getenv(name);
         return value == null || value.isBlank() ? fallback : value;
     }
 
+    /** Create a table client using the authentication profile or explicitly configured PAT. */
     static SnowflakeStreamingIngestClient createClient() throws Exception {
         Properties properties = new Properties();
         String pat = System.getenv("SNOWFLAKE_PAT");
@@ -127,6 +133,7 @@ public class ElasticProducer {
                 .setProperties(properties).build();
     }
 
+    /** Pair a stable sample source offset with the row sent to Snowflake. */
     static class Event {
         final long offset;
         final Map<String, Object> row;
@@ -148,12 +155,15 @@ public class ElasticProducer {
             this.committed = checkpoint;
             this.nextOffset = checkpoint + 1;
         }
+        /** Return the next sample event without acknowledging source progress. */
         Event read() { return nextOffset > total ? null : new Event(nextOffset++); }
+        /** Record confirmed progress; replace with your source's durable commit operation. */
         void acknowledge(long offset) {
             // Persist source progress before retiring real source events.
             if (offset < committed || offset > total) throw new IllegalArgumentException("Invalid checkpoint");
             committed = offset;
         }
+        /** Resume sample reads after confirmed progress; replace with your source seek operation. */
         void seek(long offset) {
             acknowledge(offset);
             nextOffset = offset + 1;
@@ -163,6 +173,7 @@ public class ElasticProducer {
 
     interface ClientFactory { SnowflakeStreamingIngestClient create() throws Exception; }
 
+    /** Track an event, its acknowledgement, and the client generation that submitted it. */
     static class Pending {
         final Event event;
         final CompletableFuture<Void> future;
@@ -174,12 +185,14 @@ public class ElasticProducer {
         }
     }
 
+    /** Own the SDK client and channel state needed for recovery. */
     static class Producer {
         final ClientFactory factory;
         SnowflakeStreamingIngestClient client;
         SnowflakeStreamingIngestElasticChannel channel;
         int generation;
         Producer(ClientFactory factory) { this.factory = factory; }
+        /** Create a client and obtain its cached Elastic Channel. */
         void open() throws Exception {
             SnowflakeStreamingIngestClient fresh = factory.create();
             try {
@@ -191,12 +204,14 @@ public class ElasticProducer {
             client = fresh;
             generation++;
         }
+        /** Replace the invalid client only if the failure belongs to its current generation. */
         void recover(int failedGeneration) throws Exception {
             // Several failures from one old client must trigger only one replacement.
             if (generation != failedGeneration) return;
             close(false);
             open();
         }
+        /** Close the current client; flush only when requested by the caller. */
         void close(boolean flush) throws Exception {
             if (client == null) return;
             try {
@@ -207,6 +222,7 @@ public class ElasticProducer {
         }
     }
 
+    /** Submit one event and retain its acknowledgement for checkpoint confirmation. */
     static Pending appendEvent(Producer producer, Event event, long deadline) throws Exception {
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
             remaining(deadline);
@@ -223,6 +239,7 @@ public class ElasticProducer {
         throw new IllegalStateException("Submission retry budget exhausted");
     }
 
+    /** Confirm every pending append before advancing the source checkpoint. */
     static void confirmCheckpoint(Producer producer, List<Pending> pending, SampleEventSource source,
                            long deadline) throws Exception {
         for (Pending original : pending) {

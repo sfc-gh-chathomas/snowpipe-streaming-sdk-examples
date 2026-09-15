@@ -20,6 +20,7 @@ const INVALIDATION = new Set([
 
 // Start here: source, connection, then the streaming loop.
 
+// Run the sample and close the client, retaining unconfirmed source work on failure.
 async function main() {
   const source = new SampleEventSource(Number(process.env.SNOWFLAKE_TEST_ROWS || 10_000),
     Number(process.env.SNOWFLAKE_SOURCE_CHECKPOINT || 0));
@@ -36,6 +37,7 @@ async function main() {
   }
 }
 
+// Stream retained events and pause intake at delivery checkpoints.
 async function run(producer, source) {
   const pending = [];
   let checkpointAt = performance.now() + CHECKPOINT_MS;
@@ -59,11 +61,13 @@ async function run(producer, source) {
 
 // Supporting delivery and connection details.
 
+// Identify SDK failures eligible for bounded application retry.
 function retryable(error) {
   return error instanceof StreamingIngestError &&
     (INVALIDATION.has(error.errorCode) || [408, 429, 500, 502, 503, 504].includes(error.httpStatusCode));
 }
 
+// Return the remaining checkpoint budget, or stop without advancing source progress.
 function remaining(deadline) {
   const millis = deadline - performance.now();
   if (millis <= 0) {
@@ -72,11 +76,13 @@ function remaining(deadline) {
   return millis;
 }
 
+// Wait with capped jitter without exceeding the remaining checkpoint budget.
 async function backoff(attempt, deadline) {
   const delay = Math.min(remaining(deadline), Math.random() * Math.min(10_000, 250 * 2 ** Math.min(attempt, 6)));
   await new Promise((resolve) => setTimeout(resolve, delay));
 }
 
+// Observe acknowledgement progress without cancelling or replacing the original Promise.
 async function poll(outcome, timeoutMs) {
   let timer;
   try {
@@ -89,6 +95,7 @@ async function poll(outcome, timeoutMs) {
   }
 }
 
+// Create a table client using the authentication profile or explicitly configured PAT.
 async function createClient() {
   let authentication = { profilePath: process.env.SNOWFLAKE_PROFILE || "profile.json" };
   if (process.env.SNOWFLAKE_PAT) {
@@ -122,29 +129,34 @@ class SampleEventSource {
     this.committed = checkpoint;
     this.nextOffset = checkpoint + 1;
   }
+  // Return the next sample event without acknowledging source progress.
   read() {
     if (this.nextOffset > this.total) return null;
     const offset = this.nextOffset++;
     // Replace this mapping with your target columns and stable event ID.
     return { offset, row: { EVENT_ID: offset, C1: offset, C2: `event-${offset}` } };
   }
+  // Record confirmed progress; replace with your source's durable commit operation.
   acknowledge(offset) {
     // Persist/commit source progress here before retiring real source events.
     if (offset < this.committed || offset > this.total) throw new Error("Invalid source checkpoint");
     this.committed = offset;
   }
+  // Resume sample reads after confirmed progress; replace with your source seek operation.
   seek(committed) {
     this.acknowledge(committed);
     this.nextOffset = committed + 1;
   }
 }
 
+// Own the current Elastic client and prevent stale failures from replacing a fresh client.
 class ElasticProducer {
   constructor(factory = createClient) {
     this.factory = factory;
     this.client = null;
     this.generation = 0;
   }
+  // Create a client and obtain its cached Elastic Channel.
   async open() {
     const client = await this.factory();
     try {
@@ -156,12 +168,14 @@ class ElasticProducer {
     this.client = client;
     this.generation++;
   }
+  // Replace the invalid client only if the failure belongs to its current generation.
   async recover(generation) {
     // Old pending failures must not close the replacement client.
     if (generation !== this.generation) return;
     await this.close(false);
     await this.open();
   }
+  // Close the current client; flush only when requested by the caller.
   async close(flush) {
     if (this.client) {
       try {
@@ -173,6 +187,7 @@ class ElasticProducer {
   }
 }
 
+// Submit one event and retain its acknowledgement for checkpoint confirmation.
 function appendEvent(producer, event) {
   // Observe rejection immediately, even while other events are being read.
   let promise;
@@ -192,6 +207,7 @@ function appendEvent(producer, event) {
   return item;
 }
 
+// Confirm every pending append before advancing the source checkpoint.
 async function confirmCheckpoint(producer, pending, source, deadline) {
   for (let item of pending) {
     let retries = 0;

@@ -25,6 +25,7 @@ TRANSIENT = {408, 429, 500, 502, 503, 504}
 # Start here: create a source, connect, and stream retained events.
 
 def main():
+    """Run the sample and close the client, retaining unconfirmed source work on failure."""
     source = SampleEventSource(
         int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000")),
         int(os.environ.get("SNOWFLAKE_SOURCE_CHECKPOINT", "0")),
@@ -43,6 +44,7 @@ def main():
 
 
 def run(producer, source):
+    """Stream retained events and pause intake at delivery checkpoints."""
     # Snowflake, not local submission, determines the restart position.
     source.seek(producer.open())
     last_submitted_offset = source.committed
@@ -87,12 +89,14 @@ def run(producer, source):
 # Supporting delivery and connection details.
 
 def retryable(error):
+    """Identify SDK failures eligible for bounded application retry."""
     return isinstance(error, StreamingIngestError) and (
         error.error_code.value in INVALIDATION or error.http_status_code in TRANSIENT
     )
 
 
 def remaining(deadline):
+    """Return the remaining checkpoint budget, or stop without advancing source progress."""
     seconds = deadline - time.monotonic()
     if seconds <= 0:
         raise TimeoutError("Outage deadline exceeded; source checkpoint unchanged; retain events for replay")
@@ -100,11 +104,13 @@ def remaining(deadline):
 
 
 def backoff(attempt, deadline):
+    """Wait with capped jitter without exceeding the remaining checkpoint budget."""
     delay = random.uniform(0, min(10.0, 0.25 * 2 ** min(attempt, 6)))
     time.sleep(min(delay, remaining(deadline)))
 
 
 def create_client():
+    """Create a table client using the authentication profile or explicitly configured PAT."""
     properties = None
     if os.environ.get("SNOWFLAKE_PAT"):
         properties = {
@@ -139,6 +145,7 @@ class SampleEventSource:
         self.next_offset = checkpoint + 1
 
     def read(self):
+        """Return the next sample event without acknowledging source progress."""
         # Replace this deterministic fixture with reads from your retained source.
         if self.next_offset > self.total:
             return None
@@ -149,12 +156,14 @@ class SampleEventSource:
         return offset, row
 
     def acknowledge(self, offset):
+        """Record confirmed progress; replace with your source's durable commit operation."""
         # In production, persist/commit source progress here before retiring events.
         if not self.committed <= offset <= self.total:
             raise ValueError("Invalid source checkpoint")
         self.committed = offset
 
     def seek(self, committed):
+        """Resume sample reads after confirmed progress; replace with your source seek operation."""
         # Position the retained source strictly after Snowflake committed progress.
         self.acknowledge(committed)
         self.next_offset = committed + 1
@@ -163,6 +172,7 @@ CHANNEL_NAME = os.environ.get("SNOWFLAKE_CHANNEL", "production-source-0")
 
 
 def parse_offset(token):
+    """Decode this sample's numeric source offset; an absent token means no progress."""
     return 0 if token is None else int(token)
 
 
@@ -174,6 +184,7 @@ class NamedProducer:
         self.channel = None
 
     def open(self):
+        """Open the owned named channel and return its authoritative committed source offset."""
         if self.client is None:
             self.client = self.factory()
         self.channel, status = self.client.open_channel(CHANNEL_NAME)
@@ -182,6 +193,7 @@ class NamedProducer:
         return parse_offset(status.latest_committed_offset_token)
 
     def recover(self, error):
+        """Reopen without resetting the server offset, recreating an invalid client if needed."""
         if error.error_code.value == "InvalidClientError":
             self.close(False)
         elif self.channel is not None:
@@ -198,6 +210,7 @@ class NamedProducer:
             return self.open()
 
     def close(self, flush):
+        """Close the current client; flush only when requested by the caller."""
         if self.client is not None:
             try:
                 self.client.close(wait_for_flush=flush, timeout_seconds=30)
@@ -206,6 +219,7 @@ class NamedProducer:
 
 
 def confirm_checkpoint(producer, target, source, deadline):
+    """Confirm committed progress and row health before acknowledging the source."""
     while True:
         budget = remaining(deadline)
         try:

@@ -45,6 +45,7 @@ public class NamedChannelCheckpoint {
         }
     }
 
+    /** Stream retained events and pause intake at delivery checkpoints. */
     static void run(Producer producer, SampleEventSource source) throws Exception {
         // The server checkpoint is authoritative when restarting this source.
         source.seek(producer.open());
@@ -97,12 +98,14 @@ public class NamedChannelCheckpoint {
                 || "ClosedElasticChannelError".equals(code) || "ClosedClientError".equals(code);
     }
 
+    /** Identify SDK failures eligible for bounded application retry. */
     static boolean retryable(SFException error) {
         int status = error.getHttpStatusCode();
         return invalidation(error) || status == 408 || status == 429
                 || status == 500 || status == 502 || status == 503 || status == 504;
     }
 
+    /** Return the remaining checkpoint budget, or stop without advancing source progress. */
     static long remaining(long deadline) throws TimeoutException {
         long nanos = deadline - System.nanoTime();
         if (nanos <= 0) {
@@ -111,17 +114,20 @@ public class NamedChannelCheckpoint {
         return nanos;
     }
 
+    /** Wait with capped jitter without exceeding the remaining checkpoint budget. */
     static void backoff(int attempt, long deadline) throws Exception {
         long cap = Math.min(10000, 250L << Math.min(attempt, 6));
         long delay = TimeUnit.MILLISECONDS.toNanos(ThreadLocalRandom.current().nextLong(cap + 1));
         TimeUnit.NANOSECONDS.sleep(Math.min(delay, remaining(deadline)));
     }
 
+    /** Read an optional setting, using the fallback for missing or blank values. */
     static String env(String name, String fallback) {
         String value = System.getenv(name);
         return value == null || value.isBlank() ? fallback : value;
     }
 
+    /** Create a table client using the authentication profile or explicitly configured PAT. */
     static SnowflakeStreamingIngestClient createClient() throws Exception {
         Properties properties = new Properties();
         String pat = System.getenv("SNOWFLAKE_PAT");
@@ -149,6 +155,7 @@ public class NamedChannelCheckpoint {
                 .setProperties(properties).build();
     }
 
+    /** Pair a stable sample source offset with the row sent to Snowflake. */
     static class Event {
         final long offset;
         final Map<String, Object> row;
@@ -170,12 +177,15 @@ public class NamedChannelCheckpoint {
             this.committed = checkpoint;
             this.nextOffset = checkpoint + 1;
         }
+        /** Return the next sample event without acknowledging source progress. */
         Event read() { return nextOffset > total ? null : new Event(nextOffset++); }
+        /** Record confirmed progress; replace with your source's durable commit operation. */
         void acknowledge(long offset) {
             // Persist source progress before retiring real source events.
             if (offset < committed || offset > total) throw new IllegalArgumentException("Invalid checkpoint");
             committed = offset;
         }
+        /** Resume sample reads after confirmed progress; replace with your source seek operation. */
         void seek(long offset) {
             acknowledge(offset);
             nextOffset = offset + 1;
@@ -187,13 +197,16 @@ public class NamedChannelCheckpoint {
 
     static final String CHANNEL_NAME = env("SNOWFLAKE_CHANNEL", "production-source-0");
 
+    /** Decode this sample's numeric source offset; an absent token means no progress. */
     static long parseOffset(String token) { return token == null ? 0 : Long.parseLong(token); }
 
+    /** Own the SDK client and channel state needed for recovery. */
     static class Producer {
         final ClientFactory factory;
         SnowflakeStreamingIngestClient client;
         SnowflakeStreamingIngestChannel channel;
         Producer(ClientFactory factory) { this.factory = factory; }
+        /** Open the owned named channel and return its authoritative committed source offset. */
         long open() throws Exception {
             if (client == null) client = factory.create();
             OpenChannelResult opened = client.openChannel(CHANNEL_NAME);
@@ -203,6 +216,7 @@ public class NamedChannelCheckpoint {
             }
             return parseOffset(opened.getChannelStatus().getLatestCommittedOffsetToken());
         }
+        /** Reopen without resetting the server offset, recreating an invalid client if needed. */
         long recover(SFException error) throws Exception {
             if ("InvalidClientError".equals(error.getErrorCodeName())) {
                 close(false);
@@ -222,6 +236,7 @@ public class NamedChannelCheckpoint {
                 return open();
             }
         }
+        /** Close the current client; flush only when requested by the caller. */
         void close(boolean flush) throws Exception {
             if (client == null) return;
             try {
@@ -232,6 +247,7 @@ public class NamedChannelCheckpoint {
         }
     }
 
+    /** Confirm committed progress and row health before acknowledging the source. */
     static void confirmCheckpoint(Producer producer, long target, SampleEventSource source,
                            long deadline) throws Exception {
         while (true) {
