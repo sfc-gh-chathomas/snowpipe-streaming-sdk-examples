@@ -51,11 +51,12 @@ test("caller polling timeout retains original promise; late success advances che
   await session.open();
   const source = new support.SampleEventSource(1);
   const pending = [elastic.appendEvent(session, source.read())];
-  const waiting = await support.poll(pending[0].outcome, 1);
-  assert.equal(waiting.waiting, true);
+  await elastic.collectProgress(session, pending, source, deadline());
+  assert.equal(pending.length, 1);
   assert.equal(source.committed, 0);
   resolve();
-  await elastic.confirmCheckpoint(session, pending, source, deadline());
+  await new Promise((done) => setImmediate(done));
+  await elastic.collectProgress(session, pending, source, deadline());
   assert.deepEqual(client.calls, ["1"]);
   assert.deepEqual(client.closes, []);
   assert.equal(session.generation, 1);
@@ -68,29 +69,30 @@ test("out-of-order success cannot acknowledge an earlier gap", async () => {
   await session.open();
   const source = new support.SampleEventSource(2);
   const pending = [elastic.appendEvent(session, source.read()), elastic.appendEvent(session, source.read())];
-  await assert.rejects(elastic.confirmCheckpoint(session, pending, source, performance.now() + 5), /Outage/);
+  await new Promise((done) => setImmediate(done));
+  await elastic.collectProgress(session, pending, source, deadline());
   assert.equal(source.committed, 0);
   assert.equal(pending.length, 2);
   assert.deepEqual(client.closes, []);
 });
 
-test("checkpoint count bounds source intake", async (context) => {
-  context.mock.method(Math, "random", () => 0);
-  const limit = support.CHECKPOINT_ROWS;
+test("intake continues beyond the old checkpoint while ack is pending", async () => {
   let resolve;
-  const blocked = new Promise((done) => { resolve = done; });
-  const client = elasticClient([blocked]);
-  const session = new elastic.ElasticProducer(async () => client);
-  await session.open();
-  const source = new support.SampleEventSource(limit + 1);
-  const running = elastic.run(session, source);
-  await new Promise((done) => setTimeout(done, 10));
-  assert.equal(client.calls.length, limit);
-  assert.equal(source.nextOffset, limit + 1);
-  assert.equal(source.committed, 0);
-  resolve();
-  await running;
-  assert.equal(source.committed, limit + 1);
+  const future = new Promise((done) => { resolve = done; });
+  const client = elasticClient([future]);
+  const producer = new elastic.ElasticProducer(async () => client);
+  await producer.open();
+  const source = new elastic.SampleEventSource(1005);
+  const read = source.read.bind(source);
+  source.read = () => {
+    if (client.calls.length === 1005) {
+      assert.equal(source.committed, 0);
+      resolve();
+    }
+    return read();
+  };
+  await elastic.run(producer, source);
+  assert.equal(source.committed, 1005);
 });
 
 test("429 retries the rejected event on the same client", async (context) => {
@@ -114,7 +116,10 @@ test("SDK invalidation rebuilds once for a failed generation and skips successfu
   await session.open();
   const source = new support.SampleEventSource(3);
   const pending = Array.from({ length: 3 }, () => elastic.appendEvent(session, source.read()));
-  await elastic.confirmCheckpoint(session, pending, source, deadline());
+  await new Promise((done) => setImmediate(done));
+  await elastic.collectProgress(session, pending, source, deadline());
+  await new Promise((done) => setImmediate(done));
+  await elastic.collectProgress(session, pending, source, deadline());
   assert.deepEqual(fresh.calls, ["2", "3"]);
   assert.equal(old.closes.length, 1);
   assert.equal(session.generation, 2);

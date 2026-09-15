@@ -1,7 +1,7 @@
 """Single-writer named-channel producer with source-offset recovery.
 
 Stream individual rows and checkpoint committed offsets, never local submission.
-Source events remain replayable until confirmed. A caller timeout pauses reading;
+Source events remain replayable until confirmed. SDK backpressure pauses reading;
 only SDK invalidation reopens the channel. Do not share channel ownership.
 """
 
@@ -12,6 +12,7 @@ from snowflake.ingest.streaming import StreamingIngestError, StreamingIngestErro
 import random
 from snowflake.ingest.streaming import StreamingIngestClient
 
+MAX_PENDING_EVENTS = 100_000
 CHECKPOINT_ROWS = 1_000
 CHECKPOINT_SECONDS = 5.0
 OUTAGE_SECONDS = 30 * 60.0
@@ -44,46 +45,75 @@ def main():
 
 
 def run(producer, source):
-    """Stream retained events and pause intake at delivery checkpoints."""
-    # Snowflake, not local submission, determines the restart position.
+    """Append continuously; poll committed progress without waiting for every submitted row."""
     source.seek(producer.open())
-    last_submitted_offset = source.committed
-    uncommitted_count = 0
-    retry_attempts = 0
-    deadline = time.monotonic() + OUTAGE_SECONDS
-    checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
+    submitted = source.committed
     event = None
+    exhausted = False
+    retry_attempts = 0
+    since_poll = 0
+    next_poll = time.monotonic() + CHECKPOINT_SECONDS
+    deadline = time.monotonic() + OUTAGE_SECONDS
     while True:
         try:
+            outstanding = submitted > source.committed
+            if outstanding and (exhausted or event is not None or since_poll >= CHECKPOINT_ROWS
+                                or time.monotonic() >= next_poll
+                                or submitted - source.committed >= MAX_PENDING_EVENTS):
+                previous = source.committed
+                collect_progress(producer, submitted, source)
+                if source.committed > previous:
+                    deadline = time.monotonic() + OUTAGE_SECONDS
+                    retry_attempts = 0
+                next_poll = time.monotonic() + CHECKPOINT_SECONDS
+                since_poll = 0
+            if submitted == source.committed and event is None:
+                deadline = time.monotonic() + OUTAGE_SECONDS
+                if exhausted:
+                    return
+            remaining(deadline)
+            if exhausted or submitted - source.committed >= MAX_PENDING_EVENTS:
+                time.sleep(min(POLL_SECONDS, remaining(deadline)))
+                continue
             if event is None:
                 event = source.read()
             if event is None:
-                if uncommitted_count:
-                    confirm_checkpoint(producer, last_submitted_offset, source, deadline)
-                return
-            remaining(deadline)
-            source_offset, row = event
-            # Write immediately; the SDK, not this loop, batches the transport.
-            producer.channel.append_row(row, str(source_offset))
-            last_submitted_offset = event[0]
+                exhausted = True
+                continue
+            offset, row = event
+            producer.channel.append_row(row, str(offset))
+            submitted = offset
+            since_poll += 1
             event = None
-            uncommitted_count += 1
-            if uncommitted_count >= CHECKPOINT_ROWS or time.monotonic() >= checkpoint_at:
-                confirm_checkpoint(producer, last_submitted_offset, source, deadline)
-                uncommitted_count = 0
-                retry_attempts = 0
-                deadline = time.monotonic() + OUTAGE_SECONDS
-                checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
         except StreamingIngestError as error:
-            retry_attempts += 1
-            if not retryable(error) or retry_attempts >= MAX_ATTEMPTS:
+            if not retryable(error):
                 raise
+            if error.http_status_code != 429:
+                retry_attempts += 1
+                if retry_attempts >= MAX_ATTEMPTS:
+                    raise
             if error.error_code.value in INVALIDATION:
+                previous = source.committed
                 source.seek(producer.recover(error))
-                last_submitted_offset = source.committed
-                uncommitted_count = 0
+                if source.committed > previous:
+                    deadline = time.monotonic() + OUTAGE_SECONDS
+                submitted = source.committed
                 event = None
-            backoff(retry_attempts - 1, deadline)
+                exhausted = False
+            backoff(2, deadline)
+
+
+def collect_progress(producer, submitted, source):
+    """Fetch status once and commit the confirmed prefix, checking row health first."""
+    status = producer.channel.get_channel_status()
+    if status.rows_error_count:
+        raise RuntimeError("Row errors require reconciliation before source handoff")
+    if status.status_code != "SUCCESS":
+        raise StreamingIngestError(StreamingIngestErrorCode.INVALID_CHANNEL_ERROR,
+                                   status.status_code, 409, "Conflict")
+    committed = min(submitted, parse_offset(status.latest_committed_offset_token))
+    if committed > source.committed:
+        source.acknowledge(committed)
 
 
 # Supporting delivery and connection details.
@@ -96,10 +126,10 @@ def retryable(error):
 
 
 def remaining(deadline):
-    """Return the remaining checkpoint budget, or stop without advancing source progress."""
+    """Return the remaining stalled-progress budget without advancing source progress."""
     seconds = deadline - time.monotonic()
     if seconds <= 0:
-        raise TimeoutError("Outage deadline exceeded; source checkpoint unchanged; retain events for replay")
+        raise TimeoutError("Stalled-progress deadline exceeded; retain events after the confirmed source checkpoint")
     return seconds
 
 
@@ -216,31 +246,6 @@ class NamedProducer:
                 self.client.close(wait_for_flush=flush, timeout_seconds=30)
             finally:
                 self.client = None
-
-
-def confirm_checkpoint(producer, target, source, deadline):
-    """Confirm committed progress and row health before acknowledging the source."""
-    while True:
-        budget = remaining(deadline)
-        try:
-            producer.channel.wait_for_commit(
-                lambda token: parse_offset(token) >= target,
-                timeout_seconds=max(1, min(5, int(budget))),
-            )
-            status = producer.channel.get_channel_status()
-            if status.rows_error_count:
-                raise RuntimeError("Row errors require reconciliation before source handoff")
-            if status.status_code != "SUCCESS":
-                raise StreamingIngestError(StreamingIngestErrorCode.INVALID_CHANNEL_ERROR,
-                                           status.status_code, 409, "Conflict")
-            source.acknowledge(target)
-            return
-        except TimeoutError:
-            continue
-        except StreamingIngestError as error:
-            if error.error_code.value in INVALIDATION or not retryable(error):
-                raise
-            backoff(0, deadline)
 
 
 if __name__ == "__main__":

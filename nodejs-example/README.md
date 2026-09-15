@@ -7,8 +7,8 @@ Requires **snowpipe-streaming >= 1.8.0** and Node.js >= 20.
 
 ## Adapt This Example to Your Application
 
-1. **Run the sample unchanged first.** Set your target database/schema/table and authentication profile. The production examples generate synthetic rows with `EVENT_ID NUMBER`, `C1 NUMBER`, and `C2 VARCHAR`; they do not read a broker, file, or API. Set `SNOWFLAKE_TEST_ROWS=1005` to exercise a full checkpoint and a final partial window. Successful output reports source checkpoint `1005`.
-2. **Start reading at `main`, then `run`.** The loop reads a retained event, submits it to the SDK, pauses at a checkpoint, and confirms progress before acknowledging the source. Connection and recovery details appear below that flow in the same file.
+1. **Run the sample unchanged first.** Set your target database/schema/table and authentication profile. The production examples generate synthetic rows with `EVENT_ID NUMBER`, `C1 NUMBER`, and `C2 VARCHAR`; they do not read a broker, file, or API. Set `SNOWFLAKE_TEST_ROWS=1005` to cross the progress-check cadence and exercise final drain. Successful output reports source checkpoint `1005`.
+2. **Start reading at `main`, then `run`.** The loop reads a retained event, submits it to the SDK, collects available delivery progress, and acknowledges only confirmed source events. Connection and recovery details appear below that flow in the same file.
 3. **Replace `SampleEventSource`.** Replace `read` with your source operation and change the sample row mapping to match your table. Reading must not delete or permanently acknowledge an event. End-of-input (`None`/`null`) stops the example; a temporarily idle live source must instead wait or poll with a bounded, interruptible read.
 4. **Implement durable source progress.** Replace `acknowledge` with your source commit/checkpoint operation. The sample stores progress only in memory. Elastic requires retained/replayable events and stable source-unique IDs for duplicate reconciliation. Named channels additionally require `seek` strictly after the server's committed offset and one exclusive owner per stable channel name.
 5. **Choose outage and shutdown behavior.** Pausing reads must propagate backpressure to the producer. A push source needs explicit flow control. If events cannot be replayed, persist them before accepting responsibility; the SDK memory buffer is not a disk spool. On shutdown, stop intake and confirm pending progress within your budget; retain anything unconfirmed for restart.
@@ -16,9 +16,9 @@ Requires **snowpipe-streaming >= 1.8.0** and Node.js >= 20.
 
 ### Before Production
 
-- Size checkpoints for your payloads: an event-count limit is not a byte-memory limit. Validate row sizes and account for the SDK buffer plus retained source data.
-- The five-second checkpoint check runs between source reads, not on an independent timer. Integrate bounded reads and cancellation for live sources.
-- The 30-minute checkpoint budget does not cancel SDK management calls or their independent transport retries.
+- Size the 100,000-pending-event application safety limit for your payloads: an event-count limit is not a byte-memory limit. Validate row sizes and account for the SDK buffer plus retained source data.
+- The periodic progress check runs between source reads, not on an independent timer. Integrate bounded reads and cancellation for live sources.
+- The 30-minute stalled-progress budget does not cancel SDK management calls or their independent transport retries.
 - Test restart, source checkpoint failure, invalidation, and sustained backpressure with your real source. Define storage capacity and overflow behavior before accepting unreplayable events.
 - Keep credentials in a secure credential manager and choose a role with only the required privileges. Kafka is not required solely to deliver events to Snowflake.
 
@@ -120,8 +120,9 @@ and closes the client.
 
 See the [shared retention contract](../README.md#production-retention-contract).
 Appends are issued as events are read. Rejections are observed immediately so a later checkpoint
-cannot cause an unhandled rejection. Count/time checkpoints pause intake and wait on every original
-Promise. A caller timeout neither cancels nor resubmits it. Only terminal retryable SDK failures are
+cannot cause an unhandled rejection. Progress collection retires confirmed prefixes without waiting for every original
+Promise. Event-loop yields allow native completions to run. SDK backpressure or the pending-event
+safety limit pauses intake; slow acknowledgements alone do not trigger resubmission. Only terminal retryable SDK failures are
 resubmitted; only SDK invalidation recreates the client. Old-generation failures reuse the new client.
 
 Both production programs are self-contained. The included `SampleEventSource` regenerates fixed
@@ -135,7 +136,7 @@ Demonstrates the named-channel pattern for strict exactly-once ingestion:
 
 - Opens a stable, exclusively owned channel without replacing its server offset and seeks after committed progress.
 - Appends each event with `appendRow`; the SDK buffers and batches it internally.
-- Polls channel status only at bounded count/time checkpoints and end of input; timeout pauses reading, not the SDK's retries.
+- Fetches channel status periodically and during backpressure/final drain; each fetch retains SDK request latency, but does not wait for all submitted offsets.
 - Checks row errors before source handoff. Invalidation reopens and seeks to the newly returned committed offset.
 - `SNOWFLAKE_CHANNEL` selects the stable channel. Running again resumes after committed events instead of starting from zero.
 

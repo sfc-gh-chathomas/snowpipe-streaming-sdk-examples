@@ -8,6 +8,7 @@
 
 const { createTableClient, StreamingIngestError } = require("snowpipe-streaming");
 
+const MAX_PENDING_EVENTS = 100_000;
 const CHECKPOINT_ROWS = 1_000;
 const CHECKPOINT_MS = 5_000;
 const OUTAGE_MS = 30 * 60_000;
@@ -37,26 +38,66 @@ async function main() {
   }
 }
 
-// Stream retained events and pause intake at delivery checkpoints.
+// Stream retained events while collecting confirmed delivery progress.
 async function run(producer, source) {
+  // Periodic event-loop yields let native SDK completions run during sustained intake.
   const pending = [];
-  let checkpointAt = performance.now() + CHECKPOINT_MS;
+  let event = null;
+  let exhausted = false;
+  let submittedSinceYield = 0;
   let deadline = performance.now() + OUTAGE_MS;
   while (true) {
-    // read() retains ownership; null means end-of-input, not temporary idle.
-    const event = source.read();
-    if (event === null) break;
-    const item = appendEvent(producer, event);
-    pending.push(item);
-    await Promise.resolve();
-    if (pending.some((entry) => entry.result?.error) || pending.length >= CHECKPOINT_ROWS
-        || performance.now() >= checkpointAt) {
-      await confirmCheckpoint(producer, pending, source, deadline);
-      checkpointAt = performance.now() + CHECKPOINT_MS;
+    const previous = source.committed;
+    if (exhausted || event !== null || submittedSinceYield === 0 || pending.length >= MAX_PENDING_EVENTS) {
+      await collectProgress(producer, pending, source, deadline);
+    }
+    if (source.committed > previous || (!pending.length && event === null)) {
       deadline = performance.now() + OUTAGE_MS;
     }
+    if (exhausted && !pending.length) return;
+    remaining(deadline);
+    if (exhausted || pending.length >= MAX_PENDING_EVENTS) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(POLL_MS, remaining(deadline))));
+      continue;
+    }
+    if (event === null) event = source.read();
+    if (event === null) { exhausted = true; continue; }
+    // Observe rejection immediately; source ownership remains outside the SDK.
+    const item = appendEvent(producer, event);
+    await Promise.resolve();
+    await Promise.resolve();
+    if (item.result?.error?.httpStatusCode === 429) {
+      await backoff(2, deadline);
+      continue;
+    }
+    pending.push(item);
+    event = null;
+    if (++submittedSinceYield >= CHECKPOINT_ROWS) {
+      await new Promise((resolve) => setImmediate(resolve));
+      submittedSinceYield = 0;
+    }
   }
-  await confirmCheckpoint(producer, pending, source, deadline);
+}
+
+// Collect successes without waiting for unresolved acknowledgements.
+async function collectProgress(producer, pending, source, deadline) {
+  for (let index = 0; index < pending.length; index++) {
+    const item = pending[index];
+    if (!item.result?.error) continue;
+    const error = item.result.error;
+    if (!retryable(error) || (item.retries || 0) >= MAX_ATTEMPTS - 1) throw error;
+    if (INVALIDATION.has(error.errorCode)) await producer.recover(item.generation);
+    await backoff(item.retries || 0, deadline);
+    const replacement = appendEvent(producer, item.event);
+    replacement.retries = (item.retries || 0) + 1;
+    pending[index] = replacement;
+  }
+  let count = 0;
+  while (count < pending.length && pending[count].result?.ok) count++;
+  if (count) {
+    source.acknowledge(pending[count - 1].event.offset);
+    pending.splice(0, count);
+  }
 }
 
 // Supporting delivery and connection details.
@@ -67,11 +108,11 @@ function retryable(error) {
     (INVALIDATION.has(error.errorCode) || [408, 429, 500, 502, 503, 504].includes(error.httpStatusCode));
 }
 
-// Return the remaining checkpoint budget, or stop without advancing source progress.
+// Return the remaining stalled-progress budget without advancing source progress.
 function remaining(deadline) {
   const millis = deadline - performance.now();
   if (millis <= 0) {
-    throw new Error("Outage deadline exceeded; source checkpoint unchanged; retain events for replay");
+    throw new Error("Stalled-progress deadline exceeded; retain events after the confirmed source checkpoint");
   }
   return millis;
 }
@@ -82,20 +123,6 @@ async function backoff(attempt, deadline) {
   await new Promise((resolve) => setTimeout(resolve, delay));
 }
 
-// Observe acknowledgement progress without cancelling or replacing the original Promise.
-async function poll(outcome, timeoutMs) {
-  let timer;
-  try {
-    return await Promise.race([
-      outcome,
-      new Promise((resolve) => { timer = setTimeout(() => resolve({ waiting: true }), timeoutMs); }),
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// Create a table client using the authentication profile or explicitly configured PAT.
 async function createClient() {
   let authentication = { profilePath: process.env.SNOWFLAKE_PROFILE || "profile.json" };
   if (process.env.SNOWFLAKE_PAT) {
@@ -207,32 +234,10 @@ function appendEvent(producer, event) {
   return item;
 }
 
-// Confirm every pending append before advancing the source checkpoint.
-async function confirmCheckpoint(producer, pending, source, deadline) {
-  for (let item of pending) {
-    let retries = 0;
-    while (true) {
-      const result = await poll(item.outcome, Math.min(POLL_MS, remaining(deadline)));
-      if (result.waiting) continue;
-      if (result.ok) break;
-      if (!retryable(result.error) || retries >= MAX_ATTEMPTS - 1) throw result.error;
-      if (INVALIDATION.has(result.error.errorCode)) await producer.recover(item.generation);
-      console.warn(`Retry EVENT_ID=${item.event.offset} after SDK failure; duplicates possible`);
-      await backoff(retries++, deadline);
-      item = appendEvent(producer, item.event);
-    }
-  }
-  if (pending.length) {
-    // Retire the source window only after every append acknowledgement succeeds.
-    source.acknowledge(pending[pending.length - 1].event.offset);
-    pending.length = 0;
-  }
-}
-
 if (require.main === module) {
   const keepAlive = setInterval(() => {}, 1_000);
   main().catch((error) => { console.error(error.message); process.exitCode = 1; })
     .finally(() => clearInterval(keepAlive));
 }
 
-module.exports = { SampleEventSource, retryable, remaining, backoff, createClient, CHECKPOINT_ROWS, MAX_ATTEMPTS, poll,  ElasticProducer, appendEvent, confirmCheckpoint, run, main };
+module.exports = { MAX_PENDING_EVENTS, collectProgress, SampleEventSource, retryable, remaining, backoff, createClient, CHECKPOINT_ROWS, MAX_ATTEMPTS,  ElasticProducer, appendEvent, run, main };

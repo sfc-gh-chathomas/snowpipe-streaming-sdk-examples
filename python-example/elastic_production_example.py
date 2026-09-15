@@ -1,4 +1,4 @@
-"""Append events immediately; checkpoint all acknowledgements before source handoff.
+"""Append while capacity permits; retire only confirmed source progress.
 
 The SDK owns batching and transport retries. Caller timeouts keep the original
 Future alive. Retain/replay unacknowledged source events across restarts; Elastic
@@ -14,6 +14,7 @@ import os
 import random
 from snowflake.ingest.streaming import StreamingIngestClient
 
+MAX_PENDING_EVENTS = 100_000
 CHECKPOINT_ROWS = 1_000
 CHECKPOINT_SECONDS = 5.0
 OUTAGE_SECONDS = 30 * 60.0
@@ -47,23 +48,78 @@ def main():
 
 
 def run(producer, source):
-    """Stream retained events and pause intake at delivery checkpoints."""
+    """Append while capacity is available; collect acknowledgements without draining each window."""
     pending = []
-    checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
+    event = None
+    exhausted = False
+    since_scan = 0
+    next_scan = time.monotonic() + CHECKPOINT_SECONDS
     deadline = time.monotonic() + OUTAGE_SECONDS
     while True:
-        # Read only while the previous checkpoint has capacity.
-        event = source.read()
-        if event is None:
-            # None means end-of-input, not a temporarily idle live source.
-            break
-        pending.append(append_event(producer, event, deadline))
-        failed = any(item.future.done() and item.future.exception() is not None for item in pending)
-        if failed or len(pending) >= CHECKPOINT_ROWS or time.monotonic() >= checkpoint_at:
-            confirm_checkpoint(producer, pending, source, deadline)
-            checkpoint_at = time.monotonic() + CHECKPOINT_SECONDS
+        confirmed_before = source.committed
+        if exhausted or event is not None or since_scan >= CHECKPOINT_ROWS or time.monotonic() >= next_scan or len(pending) >= MAX_PENDING_EVENTS:
+            collect_progress(producer, pending, source, deadline)
+            since_scan = 0
+            next_scan = time.monotonic() + CHECKPOINT_SECONDS
+        if source.committed > confirmed_before or (not pending and event is None):
             deadline = time.monotonic() + OUTAGE_SECONDS
-    confirm_checkpoint(producer, pending, source, deadline)
+        if exhausted and not pending:
+            return
+        remaining(deadline)
+        if exhausted or len(pending) >= MAX_PENDING_EVENTS:
+            time.sleep(min(POLL_SECONDS, remaining(deadline)))
+            continue
+        if event is None:
+            event = source.read()
+        if event is None:
+            exhausted = True
+            continue
+        try:
+            # The source keeps its copy; SDK acceptance alone is not source acknowledgement.
+            offset, row = event
+            pending.append(Pending(event, producer.channel.append_row_with_wait(row, str(offset)),
+                                   producer.generation))
+            event = None
+            since_scan += 1
+            if pending[-1].future.done() and pending[-1].future.exception() is not None:
+                since_scan = CHECKPOINT_ROWS
+        except StreamingIngestError as error:
+            if error.http_status_code != 429:
+                if not retryable(error):
+                    raise
+                if error.error_code.value in INVALIDATION:
+                    producer.recover(producer.generation)
+                pending.append(append_event(producer, event, deadline))
+                event = None
+            else:
+                # Keep this rejected event and collect progress before retrying it.
+                backoff(2, deadline)
+
+
+def collect_progress(producer, pending, source, deadline):
+    """Retire only a contiguous confirmed prefix; never wait for an unfinished Future."""
+    for index, item in enumerate(pending):
+        if not item.future.done():
+            continue
+        error = item.future.exception()
+        if error is not None:
+            if not retryable(error) or item.retries >= MAX_ATTEMPTS - 1:
+                raise error
+            if error.error_code.value in INVALIDATION:
+                producer.recover(item.generation)
+            backoff(item.retries, deadline)
+            replacement = append_event(producer, item.event, deadline)
+            replacement.retries = item.retries + 1
+            pending[index] = replacement
+    confirmed_count = 0
+    for item in pending:
+        if not item.future.done() or item.future.exception() is not None:
+            break
+        confirmed_count += 1
+    if confirmed_count:
+        # Persist source progress before discarding acknowledgement bookkeeping.
+        source.acknowledge(pending[confirmed_count - 1].event[0])
+        del pending[:confirmed_count]
 
 
 # Supporting delivery and connection details.
@@ -76,10 +132,10 @@ def retryable(error):
 
 
 def remaining(deadline):
-    """Return the remaining checkpoint budget, or stop without advancing source progress."""
+    """Return the remaining stalled-progress budget without advancing source progress."""
     seconds = deadline - time.monotonic()
     if seconds <= 0:
-        raise TimeoutError("Outage deadline exceeded; source checkpoint unchanged; retain events for replay")
+        raise TimeoutError("Stalled-progress deadline exceeded; retain events after the confirmed source checkpoint")
     return seconds
 
 
@@ -155,6 +211,7 @@ class Pending:
     event: tuple
     future: object
     generation: int
+    retries: int = 0
 
 
 class ElasticProducer:
@@ -208,34 +265,6 @@ def append_event(producer, event, deadline):
                 producer.recover(producer.generation)
             backoff(attempt, deadline)
     raise RuntimeError("Submission retry budget exhausted")
-
-
-def confirm_checkpoint(producer, pending, source, deadline):
-    """Confirm every pending append before advancing the source checkpoint."""
-    for item in pending:
-        retries = 0
-        while True:
-            budget = remaining(deadline)
-            try:
-                item.future.result(timeout=min(POLL_SECONDS, budget))
-                break
-            except TimeoutError:
-                # A caller timeout neither cancels nor resubmits this append.
-                continue
-            except StreamingIngestError as error:
-                if not retryable(error) or retries >= MAX_ATTEMPTS - 1:
-                    raise
-                if error.error_code.value in INVALIDATION:
-                    producer.recover(item.generation)
-                logging.warning("Replaying EVENT_ID=%s after terminal SDK failure; duplicates possible",
-                                item.event[0])
-                backoff(retries, deadline)
-                item = append_event(producer, item.event, deadline)
-                retries += 1
-    if pending:
-        # Every original append succeeded; the source may now retire this window.
-        source.acknowledge(pending[-1].event[0])
-        pending.clear()
 
 
 if __name__ == "__main__":

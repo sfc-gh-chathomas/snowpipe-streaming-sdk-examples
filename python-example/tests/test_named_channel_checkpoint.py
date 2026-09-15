@@ -61,7 +61,7 @@ def test_restart_seeks_after_server_committed_offset():
     source = support.SampleEventSource(5)
     named.run(session, source)
     assert session.channel.calls == [3, 4, 5]
-    assert session.channel.waits == 1
+    assert session.channel.waits == 0
     assert source.committed == 5
 
 
@@ -98,20 +98,13 @@ def test_invalidation_replays_after_server_committed_record(code):
     assert source.committed == 4
 
 
-def test_wait_timeout_does_not_reopen_or_resubmit():
-    session = Session()
-    original = session.channel.wait_for_commit
-
-    def delayed(predicate, **options):
-        session.channel.wait_for_commit = original
-        raise TimeoutError("local polling timeout")
-
-    session.channel.wait_for_commit = delayed
-    source = support.SampleEventSource(2)
-    named.run(session, source)
-    assert session.recoveries == 0
-    assert session.channel.calls == [1, 2]
-    assert source.committed == 2
+def test_partial_progress_does_not_wait_or_reopen():
+    producer = Session(1)
+    source = named.SampleEventSource(3)
+    named.collect_progress(producer, 3, source)
+    assert source.committed == 1
+    assert producer.channel.waits == 0
+    assert producer.recoveries == 0
 
 
 def test_row_errors_prevent_source_handoff():
@@ -136,7 +129,7 @@ def test_permanent_failure_preserves_checkpoint():
 def test_expired_checkpoint_does_not_advance():
     source = support.SampleEventSource(3)
     with pytest.raises(TimeoutError):
-        named.confirm_checkpoint(Session(), 3, source, support.time.monotonic() - 1)
+        named.remaining(support.time.monotonic() - 1)
     assert source.committed == 0
 
 
@@ -146,3 +139,30 @@ def test_fully_committed_source_has_no_appends():
     named.run(session, source)
     assert session.channel.calls == []
     assert source.committed == 3
+
+
+
+def test_named_continues_past_progress_check_with_uncommitted_rows(monkeypatch):
+    monkeypatch.setattr(named, "CHECKPOINT_ROWS", 2)
+    producer = Session()
+    source = named.SampleEventSource(5)
+    def status():
+        accepted = len(producer.channel.calls)
+        return SimpleNamespace(status_code="SUCCESS", rows_error_count=0,
+                               latest_committed_offset_token=str(accepted if accepted == 5 else 0))
+    producer.channel.get_channel_status = status
+    named.run(producer, source)
+    assert producer.channel.calls == [1, 2, 3, 4, 5]
+    assert source.committed == 5
+
+
+def test_idle_caught_up_source_does_not_expire(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(named.time, "monotonic", lambda: clock[0])
+    class Source(named.SampleEventSource):
+        def read(self):
+            clock[0] += 3600
+            return None
+    source = Source(0)
+    named.run(Session(), source)
+    assert source.committed == 0

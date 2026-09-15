@@ -67,22 +67,17 @@ class ElasticRecoveryContractTest {
 
     @Test
     void lateAckDoesNotResubmitOrRecreate() throws Exception {
-        AtomicInteger polls = new AtomicInteger();
-        CompletableFuture<Void> late = new CompletableFuture<>() {
-            @Override public Void get(long timeout, TimeUnit unit) throws TimeoutException {
-                if (polls.incrementAndGet() == 1) throw new TimeoutException("caller wait");
-                complete(null);
-                return null;
-            }
-        };
+        CompletableFuture<Void> late = new CompletableFuture<>();
         FakeClient fake = new FakeClient(late);
         ElasticProducer.Producer session = new ElasticProducer.Producer(() -> fake.client);
         session.open();
         ElasticProducer.SampleEventSource source = new ElasticProducer.SampleEventSource(1, 0);
         List<ElasticProducer.Pending> pending = new ArrayList<>();
         pending.add(ElasticProducer.appendEvent(session, source.read(), deadline()));
-        ElasticProducer.confirmCheckpoint(session, pending, source, deadline());
-        assertEquals(2, polls.get());
+        ElasticProducer.collectProgress(session, pending, source, deadline());
+        assertEquals(0, source.committed);
+        late.complete(null);
+        ElasticProducer.collectProgress(session, pending, source, deadline());
         assertEquals(1, fake.calls.size());
         assertEquals(0, fake.closes);
         assertEquals(1, source.committed);
@@ -98,7 +93,7 @@ class ElasticRecoveryContractTest {
         List<ElasticProducer.Pending> pending = new ArrayList<>();
         pending.add(new ElasticProducer.Pending(source.read(), waiting, session.generation));
         assertThrows(TimeoutException.class,
-                () -> ElasticProducer.confirmCheckpoint(session, pending, source, System.nanoTime() - 1));
+                () -> ElasticProducer.remaining(System.nanoTime() - 1));
         assertEquals(0, source.committed);
         assertFalse(waiting.isCancelled());
         assertEquals(1, pending.size());
@@ -128,7 +123,7 @@ class ElasticRecoveryContractTest {
         ElasticProducer.SampleEventSource source = new ElasticProducer.SampleEventSource(3, 0);
         List<ElasticProducer.Pending> pending = new ArrayList<>();
         for (int index = 0; index < 3; index++) pending.add(ElasticProducer.appendEvent(session, source.read(), deadline()));
-        ElasticProducer.confirmCheckpoint(session, pending, source, deadline());
+        ElasticProducer.collectProgress(session, pending, source, deadline());
         assertEquals(Arrays.asList("2", "3"), fresh.calls);
         assertEquals(2, builds.get());
         assertEquals(1, old.closes);

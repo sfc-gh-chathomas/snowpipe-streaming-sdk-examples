@@ -81,56 +81,46 @@ def test_append_happens_before_next_source_read():
     assert channel.calls == ["1", "2", "3", "4"]
 
 
-def test_checkpoint_pauses_source_reads_until_every_ack(monkeypatch):
-    monkeypatch.setattr(support, "CHECKPOINT_ROWS", 2)
-    source = support.SampleEventSource(3)
-
-    class Delayed(Future):
-        def result(self, timeout=None):
-            assert source.next_offset == 3
-            assert source.committed == 0
-            self.set_result(None)
-            return super().result(timeout)
-
-    channel = Channel([Delayed(), completed()])
-    session, _ = session_for(channel)
-    elastic.run(session, source)
-    assert source.committed == 3
+def test_intake_passes_old_checkpoint_until_metadata_limit(monkeypatch):
+    monkeypatch.setattr(elastic, "MAX_PENDING_EVENTS", 4)
+    monkeypatch.setattr(elastic, "CHECKPOINT_ROWS", 2)
+    future = Future()
+    channel = Channel([future])
+    producer, _ = session_for(channel)
+    source = elastic.SampleEventSource(5)
+    def release(_):
+        assert len(channel.calls) == 4
+        assert source.committed == 0
+        future.set_result(None)
+    monkeypatch.setattr(elastic.time, "sleep", release)
+    elastic.run(producer, source)
+    assert source.committed == 5
 
 
 def test_late_ack_keeps_original_future_and_client():
-    class Late(Future):
-        polls = 0
-
-        def result(self, timeout=None):
-            self.polls += 1
-            if self.polls == 1:
-                raise TimeoutError("caller wait only")
-            self.set_result(None)
-            return super().result(timeout)
-
-    future = Late()
+    future = Future()
     channel = Channel([future])
-    session, clients = session_for(channel)
-    source = support.SampleEventSource(1)
-    pending = [elastic.append_event(session, source.read(), deadline())]
-    elastic.confirm_checkpoint(session, pending, source, deadline())
-    assert future.polls == 2
-    assert channel.calls == ["1"]
-    assert session.generation == 1
-    assert clients[0].closes == []
-    assert source.committed == 1
-
-
-def test_outage_deadline_preserves_source_checkpoint():
-    session, _ = session_for(Channel())
-    source = support.SampleEventSource(1)
-    pending = [elastic.Pending(source.read(), Future(), session.generation)]
-    with pytest.raises(TimeoutError, match="retain events"):
-        elastic.confirm_checkpoint(session, pending, source, support.time.monotonic() - 1)
+    producer, clients = session_for(channel)
+    source = elastic.SampleEventSource(1)
+    pending = [elastic.append_event(producer, source.read(), deadline())]
+    elastic.collect_progress(producer, pending, source, deadline())
     assert source.committed == 0
-    assert len(pending) == 1
-    assert not pending[0].future.cancelled()
+    future.set_result(None)
+    elastic.collect_progress(producer, pending, source, deadline())
+    assert source.committed == 1
+    assert channel.calls == ["1"] and not clients[0].closes
+
+
+def test_stalled_deadline_preserves_source(monkeypatch):
+    future = Future()
+    producer, _ = session_for(Channel([future]))
+    source = elastic.SampleEventSource(1)
+    clock = [0.0]
+    monkeypatch.setattr(elastic.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(elastic.time, "sleep", lambda _: clock.__setitem__(0, clock[0] + 1801))
+    with pytest.raises(TimeoutError):
+        elastic.run(producer, source)
+    assert source.committed == 0 and not future.cancelled()
 
 
 def test_429_midstream_retries_only_rejected_event():
@@ -151,7 +141,7 @@ def test_stale_invalidations_rebuild_only_once_and_skip_acked_rows():
     session, clients = session_for(old, fresh)
     source = support.SampleEventSource(3)
     pending = [elastic.append_event(session, source.read(), deadline()) for _ in range(3)]
-    elastic.confirm_checkpoint(session, pending, source, deadline())
+    elastic.collect_progress(session, pending, source, deadline())
     assert fresh.calls == ["2", "3"]
     assert session.generation == 2
     assert len(clients[0].closes) == 1
@@ -187,11 +177,10 @@ def test_out_of_order_completion_does_not_commit_a_gap():
     later = completed()
     session, _ = session_for(Channel())
     pending = [elastic.Pending(source.read(), future, 1), elastic.Pending(source.read(), later, 1)]
-    with pytest.raises(TimeoutError):
-        elastic.confirm_checkpoint(session, pending, source, support.time.monotonic() - 1)
+    elastic.collect_progress(session, pending, source, deadline())
     assert source.committed == 0
     future.set_result(None)
-    elastic.confirm_checkpoint(session, pending, source, deadline())
+    elastic.collect_progress(session, pending, source, deadline())
     assert source.committed == 2
 
 
@@ -208,3 +197,60 @@ def test_production_examples_have_no_local_support_import():
     import named_channel_checkpoint_example as named
     for example in (elastic, named):
         assert "production_support" not in inspect.getsource(example)
+
+
+
+@pytest.mark.parametrize("module_name", ["elastic_production_example", "named_channel_checkpoint_example"])
+def test_backpressure_can_outlast_terminal_retry_budget(monkeypatch, module_name):
+    import importlib
+    module = importlib.import_module(module_name)
+    clock = [0.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "backoff", lambda *_: clock.__setitem__(0, clock[0] + 1))
+    if module is elastic:
+        pressure = failure(StreamingIngestErrorCode.RECEIVER_SATURATED, 429)
+        channel = Channel([pressure] * 10)
+        producer, _ = session_for(channel)
+    else:
+        from test_named_channel_checkpoint import Session, error
+        producer = Session()
+        attempts = [0]
+        def append(offset):
+            attempts[0] += 1
+            if attempts[0] <= 10:
+                raise error(StreamingIngestErrorCode.RECEIVER_SATURATED, 429)
+        producer.channel.on_append = append
+    source = module.SampleEventSource(1)
+    module.run(producer, source)
+    assert source.committed == 1
+
+
+def test_source_commit_failure_preserves_acknowledgement_bookkeeping():
+    class Source(elastic.SampleEventSource):
+        def acknowledge(self, offset):
+            raise OSError("source checkpoint unavailable")
+    source = Source(1)
+    producer, _ = session_for(Channel())
+    pending = [elastic.append_event(producer, source.read(), deadline())]
+    with pytest.raises(OSError):
+        elastic.collect_progress(producer, pending, source, deadline())
+    assert len(pending) == 1 and source.committed == 0
+
+
+def test_confirmed_progress_extends_stall_budget(monkeypatch):
+    clock = [0.0]
+    first, second = Future(), Future()
+    channel = Channel([first, second])
+    producer, _ = session_for(channel)
+    source = elastic.SampleEventSource(2)
+    monkeypatch.setattr(elastic.time, "monotonic", lambda: clock[0])
+    def advance(_):
+        if not first.done():
+            clock[0] = 1700
+            first.set_result(None)
+        else:
+            clock[0] = 3400
+            second.set_result(None)
+    monkeypatch.setattr(elastic.time, "sleep", advance)
+    elastic.run(producer, source)
+    assert source.committed == 2 and clock[0] > elastic.OUTAGE_SECONDS

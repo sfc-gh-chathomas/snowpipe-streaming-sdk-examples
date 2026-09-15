@@ -19,11 +19,14 @@ Each language example below includes both an Elastic Channels path and a named-c
 
 Each production example is self-contained: SDK calls, configuration, retry decisions, and the replay
 fixture live in the same file. Both modes append immediately and leave transport batching to the SDK.
-They stop reading at a bounded checkpoint (1,000 events or five seconds checked between reads).
-Elastic checkpoints await every original acknowledgement; named checkpoints confirm the source offset
-through channel status. A polling timeout does not cancel an append, resend it, or reopen a client.
-The sample stops if its shared 30-minute checkpoint/outage budget expires, leaving unconfirmed source
-progress unchanged. These are application settings, not SDK default timeouts. SDK management calls also
+They keep appending while the SDK accepts work and collect confirmed progress without draining
+every checkpoint. SDK backpressure pauses source intake; a separate 100,000-pending-event safety
+limit bounds application bookkeeping and may pause intake before the SDK buffer fills. This is not
+a byte-memory limit. Elastic retires only a contiguous acknowledged prefix; named channels fetch
+committed status periodically. Unfinished appends are never resubmitted merely because they are slow.
+The sample stops after 30 minutes without confirmed source progress while work is outstanding.
+The timer resets on confirmed progress, not on successful submissions. Caught-up idle producers
+do not expire. At end-of-input, pending work drains under the same stalled-progress policy. These are application settings, not SDK default timeouts. SDK management calls also
 have their own transport timeouts and retries; the application deadline does not cancel those calls.
 
 The producer application must retain or be able to replay unacknowledged events. The included

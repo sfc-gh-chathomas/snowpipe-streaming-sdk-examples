@@ -25,6 +25,7 @@ import java.util.concurrent.ExecutionException;
  * Retain source events across restarts; Elastic replay may duplicate them.
  */
 public class ElasticProducer {
+    static final int MAX_PENDING_EVENTS = 100_000;
     static final int CHECKPOINT_ROWS = 1000;
     static final long CHECKPOINT_NANOS = TimeUnit.SECONDS.toNanos(5);
     static final long OUTAGE_NANOS = TimeUnit.MINUTES.toNanos(30);
@@ -48,25 +49,80 @@ public class ElasticProducer {
         }
     }
 
-    /** Stream retained events and pause intake at delivery checkpoints. */
+    /** Stream retained events while collecting confirmed delivery progress. */
     static void run(Producer producer, SampleEventSource source) throws Exception {
         List<Pending> pending = new ArrayList<>();
-        long checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
+        Event event = null;
+        boolean exhausted = false;
+        int sinceScan = 0;
+        long nextScan = System.nanoTime() + CHECKPOINT_NANOS;
         long deadline = System.nanoTime() + OUTAGE_NANOS;
-        Event event;
-        while ((event = source.read()) != null) {
-            pending.add(appendEvent(producer, event, deadline));
-            if (pending.stream().anyMatch(item -> item.future.isCompletedExceptionally())
-                    || pending.size() >= CHECKPOINT_ROWS || System.nanoTime() >= checkpointAt) {
-                confirmCheckpoint(producer, pending, source, deadline);
-                checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
+        while (true) {
+            long previous = source.committed;
+            if (exhausted || event != null || sinceScan >= CHECKPOINT_ROWS || System.nanoTime() >= nextScan
+                    || pending.size() >= MAX_PENDING_EVENTS) {
+                collectProgress(producer, pending, source, deadline);
+                sinceScan = 0;
+                nextScan = System.nanoTime() + CHECKPOINT_NANOS;
+            }
+            if (source.committed > previous || (pending.isEmpty() && event == null)) {
                 deadline = System.nanoTime() + OUTAGE_NANOS;
             }
+            if (exhausted && pending.isEmpty()) return;
+            remaining(deadline);
+            if (exhausted || pending.size() >= MAX_PENDING_EVENTS) {
+                TimeUnit.NANOSECONDS.sleep(Math.min(TimeUnit.SECONDS.toNanos(1), remaining(deadline)));
+                continue;
+            }
+            if (event == null) event = source.read();
+            if (event == null) { exhausted = true; continue; }
+            try {
+                // SDK acceptance does not retire the retained source event.
+                pending.add(new Pending(event, producer.channel.appendRowWithWait(event.row,
+                        String.valueOf(event.offset)), producer.generation));
+                event = null;
+                sinceScan++;
+                if (pending.get(pending.size() - 1).future.isCompletedExceptionally()) sinceScan = CHECKPOINT_ROWS;
+            } catch (SFException error) {
+                if (error.getHttpStatusCode() == 429) {
+                    backoff(2, deadline);
+                } else {
+                    if (!retryable(error)) throw error;
+                    if (invalidation(error)) producer.recover(producer.generation);
+                    pending.add(appendEvent(producer, event, deadline));
+                    event = null;
+                }
+            }
         }
-        confirmCheckpoint(producer, pending, source, deadline);
     }
 
-
+    /** Collect completed outcomes without waiting for unfinished acknowledgements. */
+    static void collectProgress(Producer producer, List<Pending> pending, SampleEventSource source,
+                                long deadline) throws Exception {
+        for (int index = 0; index < pending.size(); index++) {
+            Pending item = pending.get(index);
+            if (!item.future.isDone()) continue;
+            try {
+                item.future.get();
+            } catch (ExecutionException failure) {
+                if (!(failure.getCause() instanceof SFException)) throw failure;
+                SFException error = (SFException) failure.getCause();
+                if (!retryable(error) || item.retries >= MAX_ATTEMPTS - 1) throw error;
+                if (invalidation(error)) producer.recover(item.generation);
+                backoff(item.retries, deadline);
+                Pending replacement = appendEvent(producer, item.event, deadline);
+                replacement.retries = item.retries + 1;
+                pending.set(index, replacement);
+            }
+        }
+        int count = 0;
+        while (count < pending.size() && pending.get(count).future.isDone()
+                && !pending.get(count).future.isCompletedExceptionally()) count++;
+        if (count > 0) {
+            source.acknowledge(pending.get(count - 1).event.offset);
+            pending.subList(0, count).clear();
+        }
+    }
 
     // Supporting delivery and connection details.
     static boolean invalidation(SFException error) {
@@ -83,11 +139,11 @@ public class ElasticProducer {
                 || status == 500 || status == 502 || status == 503 || status == 504;
     }
 
-    /** Return the remaining checkpoint budget, or stop without advancing source progress. */
+    /** Return the remaining stalled-progress budget without advancing source progress. */
     static long remaining(long deadline) throws TimeoutException {
         long nanos = deadline - System.nanoTime();
         if (nanos <= 0) {
-            throw new TimeoutException("Outage deadline exceeded; retain events after source checkpoint for replay");
+            throw new TimeoutException("Stalled-progress deadline exceeded; retain events after source checkpoint for replay");
         }
         return nanos;
     }
@@ -178,6 +234,7 @@ public class ElasticProducer {
         final Event event;
         final CompletableFuture<Void> future;
         final int generation;
+        int retries;
         Pending(Event event, CompletableFuture<Void> future, int generation) {
             this.event = event;
             this.future = future;
@@ -238,38 +295,5 @@ public class ElasticProducer {
         }
         throw new IllegalStateException("Submission retry budget exhausted");
     }
-
-    /** Confirm every pending append before advancing the source checkpoint. */
-    static void confirmCheckpoint(Producer producer, List<Pending> pending, SampleEventSource source,
-                           long deadline) throws Exception {
-        for (Pending original : pending) {
-            Pending item = original;
-            int retries = 0;
-            while (true) {
-                long budget = remaining(deadline);
-                try {
-                    item.future.get(Math.min(TimeUnit.SECONDS.toNanos(1), budget), TimeUnit.NANOSECONDS);
-                    break;
-                } catch (TimeoutException waiting) {
-                    // Keep the original Future; a caller timeout is not an SDK failure.
-                } catch (ExecutionException failure) {
-                    Throwable cause = failure.getCause();
-                    if (!(cause instanceof SFException)) throw failure;
-                    SFException error = (SFException) cause;
-                    if (!retryable(error) || retries >= MAX_ATTEMPTS - 1) throw error;
-                    if (invalidation(error)) producer.recover(item.generation);
-                    System.err.println("Replaying EVENT_ID=" + item.event.offset + "; duplicates possible");
-                    backoff(retries++, deadline);
-                    item = appendEvent(producer, item.event, deadline);
-                }
-            }
-        }
-        if (!pending.isEmpty()) {
-            // All original acknowledgements succeeded before source progress advances.
-            source.acknowledge(pending.get(pending.size() - 1).event.offset);
-            pending.clear();
-        }
-    }
-
 
 }

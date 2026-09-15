@@ -23,6 +23,7 @@ import java.time.Duration;
  * SDK invalidation reopens. Do not share ownership of the same channel.
  */
 public class NamedChannelCheckpoint {
+    static final int MAX_PENDING_EVENTS = 100_000;
     static final int CHECKPOINT_ROWS = 1000;
     static final long CHECKPOINT_NANOS = TimeUnit.SECONDS.toNanos(5);
     static final long OUTAGE_NANOS = TimeUnit.MINUTES.toNanos(30);
@@ -45,50 +46,67 @@ public class NamedChannelCheckpoint {
         }
     }
 
-    /** Stream retained events and pause intake at delivery checkpoints. */
+    /** Stream retained events while collecting confirmed delivery progress. */
     static void run(Producer producer, SampleEventSource source) throws Exception {
-        // The server checkpoint is authoritative when restarting this source.
         source.seek(producer.open());
-        long lastSubmittedOffset = source.committed;
-        int uncommittedCount = 0;
-        int retryAttempts = 0;
+        long submitted = source.committed;
         Event event = null;
+        boolean exhausted = false;
+        int failures = 0;
+        int sincePoll = 0;
+        long nextPoll = System.nanoTime() + CHECKPOINT_NANOS;
         long deadline = System.nanoTime() + OUTAGE_NANOS;
-        long checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
         while (true) {
             try {
-                if (event == null) event = source.read();
-                if (event == null) {
-                    if (uncommittedCount > 0) confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
-                    return;
+                if (submitted > source.committed && (exhausted || event != null || sincePoll >= CHECKPOINT_ROWS
+                        || System.nanoTime() >= nextPoll || submitted - source.committed >= MAX_PENDING_EVENTS)) {
+                    long previous = source.committed;
+                    collectProgress(producer, submitted, source);
+                    if (source.committed > previous) { deadline = System.nanoTime() + OUTAGE_NANOS; failures = 0; }
+                    nextPoll = System.nanoTime() + CHECKPOINT_NANOS;
+                    sincePoll = 0;
+                }
+                if (submitted == source.committed && event == null) {
+                    deadline = System.nanoTime() + OUTAGE_NANOS;
+                    if (exhausted) return;
                 }
                 remaining(deadline);
-                // Write immediately; the SDK handles transport batching.
+                if (exhausted || submitted - source.committed >= MAX_PENDING_EVENTS) {
+                    TimeUnit.NANOSECONDS.sleep(Math.min(TimeUnit.SECONDS.toNanos(1), remaining(deadline)));
+                    continue;
+                }
+                if (event == null) event = source.read();
+                if (event == null) { exhausted = true; continue; }
                 producer.channel.appendRow(event.row, String.valueOf(event.offset));
-                lastSubmittedOffset = event.offset;
+                submitted = event.offset;
                 event = null;
-                uncommittedCount++;
-                if (uncommittedCount >= CHECKPOINT_ROWS || System.nanoTime() >= checkpointAt) {
-                    confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
-                    uncommittedCount = 0;
-                    retryAttempts = 0;
-                    deadline = System.nanoTime() + OUTAGE_NANOS;
-                    checkpointAt = System.nanoTime() + CHECKPOINT_NANOS;
-                }
+                sincePoll++;
             } catch (SFException error) {
-                if (!retryable(error) || ++retryAttempts >= MAX_ATTEMPTS) throw error;
+                if (!retryable(error)) throw error;
+                if (error.getHttpStatusCode() != 429 && ++failures >= MAX_ATTEMPTS) throw error;
                 if (invalidation(error)) {
+                    long previous = source.committed;
                     source.seek(producer.recover(error));
-                    lastSubmittedOffset = source.committed;
-                    uncommittedCount = 0;
+                    if (source.committed > previous) deadline = System.nanoTime() + OUTAGE_NANOS;
+                    submitted = source.committed;
                     event = null;
+                    exhausted = false;
                 }
-                backoff(retryAttempts - 1, deadline);
+                backoff(2, deadline);
             }
         }
     }
 
-
+    /** Fetch committed progress once, checking row health before source handoff. */
+    static void collectProgress(Producer producer, long submitted, SampleEventSource source) {
+        ChannelStatus status = producer.channel.getChannelStatus();
+        if (status.getRowsErrorCount() > 0) throw new IllegalStateException("Reconcile row errors before handoff");
+        if (!"SUCCESS".equals(status.getStatusCode())) {
+            throw new SFException("InvalidChannelError", status.getStatusCode(), 409, "Conflict");
+        }
+        long committed = Math.min(submitted, parseOffset(status.getLatestCommittedOffsetToken()));
+        if (committed > source.committed) source.acknowledge(committed);
+    }
 
     // Supporting delivery and connection details.
     static boolean invalidation(SFException error) {
@@ -105,11 +123,11 @@ public class NamedChannelCheckpoint {
                 || status == 500 || status == 502 || status == 503 || status == 504;
     }
 
-    /** Return the remaining checkpoint budget, or stop without advancing source progress. */
+    /** Return the remaining stalled-progress budget without advancing source progress. */
     static long remaining(long deadline) throws TimeoutException {
         long nanos = deadline - System.nanoTime();
         if (nanos <= 0) {
-            throw new TimeoutException("Outage deadline exceeded; retain events after source checkpoint for replay");
+            throw new TimeoutException("Stalled-progress deadline exceeded; retain events after source checkpoint for replay");
         }
         return nanos;
     }
@@ -246,28 +264,5 @@ public class NamedChannelCheckpoint {
             }
         }
     }
-
-    /** Confirm committed progress and row health before acknowledging the source. */
-    static void confirmCheckpoint(Producer producer, long target, SampleEventSource source,
-                           long deadline) throws Exception {
-        while (true) {
-            remaining(deadline);
-            try {
-                ChannelStatus status = producer.channel.getChannelStatus();
-                if (status.getRowsErrorCount() > 0) throw new IllegalStateException("Reconcile row errors before handoff");
-                if (!"SUCCESS".equals(status.getStatusCode())) {
-                    throw new SFException("InvalidChannelError", status.getStatusCode(), 409, "Conflict");
-                }
-                if (parseOffset(status.getLatestCommittedOffsetToken()) >= target) {
-                    source.acknowledge(target);
-                    return;
-                }
-            } catch (SFException error) {
-                if (invalidation(error) || !retryable(error)) throw error;
-            }
-            backoff(2, deadline);
-        }
-    }
-
 
 }

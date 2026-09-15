@@ -7,6 +7,7 @@
 
 const { createTableClient, StreamingIngestError } = require("snowpipe-streaming");
 
+const MAX_PENDING_EVENTS = 100_000;
 const CHECKPOINT_ROWS = 1_000;
 const CHECKPOINT_MS = 5_000;
 const OUTAGE_MS = 30 * 60_000;
@@ -35,47 +36,66 @@ async function main() {
   }
 }
 
-// Stream retained events and pause intake at delivery checkpoints.
+// Stream retained events while collecting confirmed delivery progress.
 async function run(producer, source) {
-  // Resume after the server checkpoint, never after the last submitted event.
   source.seek(await producer.open());
-  let lastSubmittedOffset = source.committed;
-  let uncommittedCount = 0;
-  let retryAttempts = 0;
+  let submitted = source.committed;
   let event = null;
+  let exhausted = false;
+  let failures = 0;
+  let sincePoll = 0;
+  let nextPoll = performance.now() + CHECKPOINT_MS;
   let deadline = performance.now() + OUTAGE_MS;
-  let checkpointAt = performance.now() + CHECKPOINT_MS;
   while (true) {
     try {
-      if (event === null) event = source.read();
-      if (event === null) {
-        if (uncommittedCount) await confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
-        return;
+      if (submitted > source.committed && (exhausted || event !== null || sincePoll >= CHECKPOINT_ROWS
+          || performance.now() >= nextPoll || submitted - source.committed >= MAX_PENDING_EVENTS)) {
+        const previous = source.committed;
+        await collectProgress(producer, submitted, source);
+        if (source.committed > previous) { deadline = performance.now() + OUTAGE_MS; failures = 0; }
+        nextPoll = performance.now() + CHECKPOINT_MS;
+        sincePoll = 0;
+      }
+      if (submitted === source.committed && event === null) {
+        deadline = performance.now() + OUTAGE_MS;
+        if (exhausted) return;
       }
       remaining(deadline);
-      // Write immediately; the SDK handles transport batching.
+      if (exhausted || submitted - source.committed >= MAX_PENDING_EVENTS) {
+        await new Promise((resolve) => setTimeout(resolve, Math.min(POLL_MS, remaining(deadline))));
+        continue;
+      }
+      if (event === null) event = source.read();
+      if (event === null) { exhausted = true; continue; }
       producer.channel.appendRow(event.row, String(event.offset));
-      lastSubmittedOffset = event.offset;
+      submitted = event.offset;
       event = null;
-      uncommittedCount++;
-      if (uncommittedCount >= CHECKPOINT_ROWS || performance.now() >= checkpointAt) {
-        await confirmCheckpoint(producer, lastSubmittedOffset, source, deadline);
-        uncommittedCount = 0;
-        retryAttempts = 0;
-        deadline = performance.now() + OUTAGE_MS;
-        checkpointAt = performance.now() + CHECKPOINT_MS;
-      }
+      sincePoll++;
     } catch (error) {
-      if (!retryable(error) || ++retryAttempts >= MAX_ATTEMPTS) throw error;
+      if (!retryable(error)) throw error;
+      if (error.httpStatusCode !== 429 && ++failures >= MAX_ATTEMPTS) throw error;
       if (INVALIDATION.has(error.errorCode)) {
+        const previous = source.committed;
         source.seek(await producer.recover(error));
-        lastSubmittedOffset = source.committed;
-        uncommittedCount = 0;
+        if (source.committed > previous) deadline = performance.now() + OUTAGE_MS;
+        submitted = source.committed;
         event = null;
+        exhausted = false;
       }
-      await backoff(retryAttempts - 1, deadline);
+      await backoff(2, deadline);
     }
   }
+}
+
+// Fetch once: a partial committed offset is useful progress, not a reason to block.
+async function collectProgress(producer, submitted, source) {
+  const status = await producer.channel.getChannelStatus();
+  if (status.rowsErrorCount) throw new Error("Reconcile row errors before source handoff");
+  if (status.statusCode !== "SUCCESS") {
+    throw new StreamingIngestError("InvalidChannelError", status.statusCode, 409, "Conflict");
+  }
+  const committed = Math.min(submitted, parseOffset(status.latestCommittedOffsetToken));
+  if (committed > source.committed) source.acknowledge(committed);
 }
 
 // Supporting delivery and connection details.
@@ -86,11 +106,11 @@ function retryable(error) {
     (INVALIDATION.has(error.errorCode) || [408, 429, 500, 502, 503, 504].includes(error.httpStatusCode));
 }
 
-// Return the remaining checkpoint budget, or stop without advancing source progress.
+// Return the remaining stalled-progress budget without advancing source progress.
 function remaining(deadline) {
   const millis = deadline - performance.now();
   if (millis <= 0) {
-    throw new Error("Outage deadline exceeded; source checkpoint unchanged; retain events for replay");
+    throw new Error("Stalled-progress deadline exceeded; retain events after the confirmed source checkpoint");
   }
   return millis;
 }
@@ -206,31 +226,10 @@ class NamedProducer {
   }
 }
 
-// Confirm committed progress and row health before acknowledging the source.
-async function confirmCheckpoint(producer, target, source, deadline) {
-  while (true) {
-    remaining(deadline);
-    try {
-      const status = await producer.channel.getChannelStatus();
-      if (status.rowsErrorCount) throw new Error("Reconcile row errors before source handoff");
-      if (status.statusCode !== "SUCCESS") {
-        throw new StreamingIngestError("InvalidChannelError", status.statusCode, 409, "Conflict");
-      }
-      if (parseOffset(status.latestCommittedOffsetToken) >= target) {
-        source.acknowledge(target);
-        return;
-      }
-    } catch (error) {
-      if (INVALIDATION.has(error.errorCode) || !retryable(error)) throw error;
-    }
-    await backoff(2, deadline);
-  }
-}
-
 if (require.main === module) {
   const keepAlive = setInterval(() => {}, 1_000);
   main().catch((error) => { console.error(error.message); process.exitCode = 1; })
     .finally(() => clearInterval(keepAlive));
 }
 
-module.exports = { SampleEventSource, retryable, remaining, backoff, createClient, CHECKPOINT_ROWS, MAX_ATTEMPTS,  NamedProducer, parseOffset, confirmCheckpoint, run, main };
+module.exports = { MAX_PENDING_EVENTS, collectProgress, SampleEventSource, retryable, remaining, backoff, createClient, CHECKPOINT_ROWS, MAX_ATTEMPTS,  NamedProducer, parseOffset, run, main };

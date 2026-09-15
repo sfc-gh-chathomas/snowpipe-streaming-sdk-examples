@@ -5,8 +5,8 @@ Examples for ingesting data into Snowflake with the [Snowpipe Streaming](https:/
 
 ## Adapt This Example to Your Application
 
-1. **Run the sample unchanged first.** Set your target database/schema/table and authentication profile. The production examples generate synthetic rows with `EVENT_ID NUMBER`, `C1 NUMBER`, and `C2 VARCHAR`; they do not read a broker, file, or API. Set `SNOWFLAKE_TEST_ROWS=1005` to exercise a full checkpoint and a final partial window. Successful output reports source checkpoint `1005`.
-2. **Start reading at `main`, then `run`.** The loop reads a retained event, submits it to the SDK, pauses at a checkpoint, and confirms progress before acknowledging the source. Connection and recovery details appear below that flow in the same file.
+1. **Run the sample unchanged first.** Set your target database/schema/table and authentication profile. The production examples generate synthetic rows with `EVENT_ID NUMBER`, `C1 NUMBER`, and `C2 VARCHAR`; they do not read a broker, file, or API. Set `SNOWFLAKE_TEST_ROWS=1005` to cross the progress-check cadence and exercise final drain. Successful output reports source checkpoint `1005`.
+2. **Start reading at `main`, then `run`.** The loop reads a retained event, submits it to the SDK, collects available delivery progress, and acknowledges only confirmed source events. Connection and recovery details appear below that flow in the same file.
 3. **Replace `SampleEventSource`.** Replace `read` with your source operation and change the sample row mapping to match your table. Reading must not delete or permanently acknowledge an event. End-of-input (`None`/`null`) stops the example; a temporarily idle live source must instead wait or poll with a bounded, interruptible read.
 4. **Implement durable source progress.** Replace `acknowledge` with your source commit/checkpoint operation. The sample stores progress only in memory. Elastic requires retained/replayable events and stable source-unique IDs for duplicate reconciliation. Named channels additionally require `seek` strictly after the server's committed offset and one exclusive owner per stable channel name.
 5. **Choose outage and shutdown behavior.** Pausing reads must propagate backpressure to the producer. A push source needs explicit flow control. If events cannot be replayed, persist them before accepting responsibility; the SDK memory buffer is not a disk spool. On shutdown, stop intake and confirm pending progress within your budget; retain anything unconfirmed for restart.
@@ -14,9 +14,9 @@ Examples for ingesting data into Snowflake with the [Snowpipe Streaming](https:/
 
 ### Before Production
 
-- Size checkpoints for your payloads: an event-count limit is not a byte-memory limit. Validate row sizes and account for the SDK buffer plus retained source data.
-- The five-second checkpoint check runs between source reads, not on an independent timer. Integrate bounded reads and cancellation for live sources.
-- The 30-minute checkpoint budget does not cancel SDK management calls or their independent transport retries.
+- Size the 100,000-pending-event application safety limit for your payloads: an event-count limit is not a byte-memory limit. Validate row sizes and account for the SDK buffer plus retained source data.
+- The periodic progress check runs between source reads, not on an independent timer. Integrate bounded reads and cancellation for live sources.
+- The 30-minute stalled-progress budget does not cancel SDK management calls or their independent transport retries.
 - Test restart, source checkpoint failure, invalidation, and sustained backpressure with your real source. Define storage capacity and overflow behavior before accepting unreplayable events.
 - Keep credentials in a secure credential manager and choose a role with only the required privileges. Kafka is not required solely to deliver events to Snowflake.
 
@@ -132,8 +132,8 @@ The second argument to every append is an **append token**: an opaque id you cho
 
 See the [shared retention contract](../README.md#production-retention-contract).
 `elastic_production_example.py` submits each event immediately with `append_row_with_wait`, then
-waits on the original Futures at a bounded count/time checkpoint. It does not batch payloads or wait
-for each row before reading the next one. Polling timeouts pause intake without resubmission. SDK
+collects completed original Futures without waiting for an entire window. It does not batch payloads
+or wait for each row. Intake pauses on SDK backpressure or the application pending-event limit. SDK
 invalidation recreates the client; a generation check prevents old failures from rebuilding it again.
 Only terminal retryable SDK errors are resubmitted, with explicit duplicate risk.
 
@@ -148,7 +148,7 @@ PAT mode requires `SNOWFLAKE_PAT`, `SNOWFLAKE_ACCOUNT`, and `SNOWFLAKE_URL`; the
 
 1. Open a stable, exclusively owned channel without replacing its server offset, then seek the source after the returned committed offset.
 2. Append individual rows with source-offset tokens; SDK buffering handles transport batching.
-3. At a bounded count/time checkpoint or end of input, wait for committed progress and check row errors before handing off source progress.
+3. Periodically fetch committed status once and check row errors before handing off confirmed progress. Keep appending between polls; drain at end of input.
 4. Retry local backpressure on the same event. On SDK invalidation, reopen and seek again; client invalidation requires a new client.
 
 Offset tokens are opaque to Snowflake; this fixture encodes numeric offsets as strings and compares
