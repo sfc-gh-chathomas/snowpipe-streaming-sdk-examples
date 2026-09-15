@@ -14,7 +14,7 @@ from snowflake.ingest.streaming import StreamingIngestClient
 
 CHECKPOINT_ROWS = 1_000
 CHECKPOINT_SECONDS = 5.0
-OUTAGE_SECONDS = 300.0
+OUTAGE_SECONDS = 30 * 60.0
 POLL_SECONDS = 1.0
 MAX_ATTEMPTS = 6
 INVALIDATION = {"InvalidChannelError", "InvalidClientError", "ClosedChannelError",

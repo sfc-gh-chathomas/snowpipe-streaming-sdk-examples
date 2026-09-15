@@ -22,7 +22,7 @@ fixture live in the same file. Both modes append immediately and leave transport
 They stop reading at a bounded checkpoint (1,000 events or five seconds checked between reads).
 Elastic checkpoints await every original acknowledgement; named checkpoints confirm the source offset
 through channel status. A polling timeout does not cancel an append, resend it, or reopen a client.
-The sample stops if its shared five-minute checkpoint/outage budget expires, leaving unconfirmed source
+The sample stops if its shared 30-minute checkpoint/outage budget expires, leaving unconfirmed source
 progress unchanged. These are application settings, not SDK default timeouts. SDK management calls also
 have their own transport timeouts and retries; the application deadline does not cancel those calls.
 

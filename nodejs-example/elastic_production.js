@@ -10,7 +10,7 @@ const { createTableClient, StreamingIngestError } = require("snowpipe-streaming"
 
 const CHECKPOINT_ROWS = 1_000;
 const CHECKPOINT_MS = 5_000;
-const OUTAGE_MS = 300_000;
+const OUTAGE_MS = 30 * 60_000;
 const POLL_MS = 1_000;
 const MAX_ATTEMPTS = 6;
 const INVALIDATION = new Set([

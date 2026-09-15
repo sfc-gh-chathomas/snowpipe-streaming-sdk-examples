@@ -25,7 +25,7 @@ import java.time.Duration;
 public class NamedChannelCheckpoint {
     static final int CHECKPOINT_ROWS = 1000;
     static final long CHECKPOINT_NANOS = TimeUnit.SECONDS.toNanos(5);
-    static final long OUTAGE_NANOS = TimeUnit.MINUTES.toNanos(5);
+    static final long OUTAGE_NANOS = TimeUnit.MINUTES.toNanos(30);
     static final int MAX_ATTEMPTS = 6;
 
     // Start here: create a source, connect, and stream retained events.

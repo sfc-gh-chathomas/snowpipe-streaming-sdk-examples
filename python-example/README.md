@@ -16,7 +16,7 @@ Examples for ingesting data into Snowflake with the [Snowpipe Streaming](https:/
 
 - Size checkpoints for your payloads: an event-count limit is not a byte-memory limit. Validate row sizes and account for the SDK buffer plus retained source data.
 - The five-second checkpoint check runs between source reads, not on an independent timer. Integrate bounded reads and cancellation for live sources.
-- The five-minute checkpoint budget does not cancel SDK management calls or their independent transport retries.
+- The 30-minute checkpoint budget does not cancel SDK management calls or their independent transport retries.
 - Test restart, source checkpoint failure, invalidation, and sustained backpressure with your real source. Define storage capacity and overflow behavior before accepting unreplayable events.
 - Keep credentials in a secure credential manager and choose a role with only the required privileges. Kafka is not required solely to deliver events to Snowflake.
 
