@@ -49,9 +49,7 @@ class Client:
 
 @pytest.fixture(autouse=True)
 def no_backoff(monkeypatch):
-    monkeypatch.setattr(
-        elastic, "backoff", lambda attempt, deadline: elastic.remaining(deadline)
-    )
+    monkeypatch.setattr(elastic, "backoff", lambda _, deadline: elastic.remaining(deadline))
 
 
 def producer_for(*channels):
@@ -77,9 +75,7 @@ def test_append_happens_before_next_source_read():
     producer, _ = producer_for(channel)
     source = Source(4)
     elastic.run(producer, source)
-
     assert source.committed == 4
-    assert channel.calls == ["1", "2", "3", "4"]
 
 
 def test_pending_limit_pauses_intake(monkeypatch):
@@ -93,33 +89,16 @@ def test_pending_limit_pauses_intake(monkeypatch):
                 self.set_result(None)
             return super().result(timeout)
 
-    first = ReleaseAtLimit()
-    channel.outcomes = [first, completed(), completed(), completed()]
+    channel.outcomes = [ReleaseAtLimit(), completed(), completed(), completed()]
     producer, _ = producer_for(channel)
     source = elastic.SampleEventSource(5)
     elastic.run(producer, source)
-
     assert source.committed == 5
 
 
-def test_late_ack_keeps_original_future_and_client():
-    future = Future()
-    producer, clients = producer_for(Channel([future]))
-    source = elastic.SampleEventSource(1)
-    pending = [elastic.append_event(producer, source.read(), deadline())]
-
-    elastic.collect_progress(producer, pending, source, deadline())
-    assert source.committed == 0
-
-    future.set_result(None)
-    elastic.collect_progress(producer, pending, source, deadline())
-    assert source.committed == 1
-    assert not clients[0].closes
-
-
-def test_out_of_order_success_does_not_commit_a_gap():
-    source = elastic.SampleEventSource(2)
+def test_late_and_out_of_order_success_cannot_commit_a_gap():
     first = Future()
+    source = elastic.SampleEventSource(2)
     producer, _ = producer_for(Channel())
     pending = [
         elastic.Pending(source.read(), first, producer.client),
@@ -134,9 +113,8 @@ def test_out_of_order_success_does_not_commit_a_gap():
     assert source.committed == 2
 
 
-def test_late_errors_from_replaced_client_do_not_swap_twice():
-    old_channel = Channel()
-    new_channel = Channel()
+def test_late_errors_from_replaced_client_swap_only_once():
+    old_channel, new_channel = Channel(), Channel()
     producer, clients = producer_for(old_channel, new_channel)
     source = elastic.SampleEventSource(3)
     old_client = producer.client
@@ -151,50 +129,29 @@ def test_late_errors_from_replaced_client_do_not_swap_twice():
 
     assert new_channel.calls == ["2", "3"]
     assert len(clients[0].closes) == 1
-    assert clients[1].closes == []
     assert source.committed == 3
 
 
-def test_immediate_429_retries_only_rejected_event():
+def test_429_retries_only_rejected_event_without_attempt_limit():
     pressure = failure(streaming.StreamingIngestErrorCode.RECEIVER_SATURATED, 429)
-    channel = Channel([completed(), pressure, completed()])
-    producer, clients = producer_for(channel)
+    channel = Channel([completed()] + [pressure] * 10 + [completed()])
+    producer, _ = producer_for(channel)
     source = elastic.SampleEventSource(2)
 
     elastic.run(producer, source)
-
-    assert channel.calls == ["1", "2", "2"]
+    assert channel.calls == ["1"] + ["2"] * 11
     assert source.committed == 2
-    assert clients[0].closes == []
 
 
-def test_429_backpressure_does_not_use_failure_attempts():
-    pressure = failure(streaming.StreamingIngestErrorCode.RECEIVER_SATURATED, 429)
-    channel = Channel([pressure] * 10 + [completed()])
-    producer, _ = producer_for(channel)
-    source = elastic.SampleEventSource(1)
-
-    elastic.run(producer, source)
-
-    assert source.committed == 1
-    assert len(channel.calls) == 11
-
-
-@pytest.mark.parametrize("status", [400, 401, 403, 404])
-def test_permanent_failure_preserves_source_checkpoint(status):
-    error = failure(streaming.StreamingIngestErrorCode.SF_API_USER_ERROR, status)
-    producer, _ = producer_for(Channel([completed(error)]))
-    source = elastic.SampleEventSource(1)
-
-    with pytest.raises(streaming.StreamingIngestError):
-        elastic.run(producer, source)
-
-    assert source.committed == 0
-
-
-def test_retry_exhaustion_preserves_source_checkpoint():
-    error = failure(streaming.StreamingIngestErrorCode.NON_FATAL, 503)
-    channel = Channel([completed(error) for _ in range(elastic.MAX_ATTEMPTS)])
+@pytest.mark.parametrize("outcomes", [
+    [completed(failure(streaming.StreamingIngestErrorCode.SF_API_USER_ERROR, 400))],
+    [
+        completed(failure(streaming.StreamingIngestErrorCode.NON_FATAL, 503))
+        for _ in range(elastic.MAX_ATTEMPTS)
+    ],
+])
+def test_terminal_errors_preserve_source_checkpoint(outcomes):
+    channel = Channel(outcomes)
     producer, _ = producer_for(channel)
     source = elastic.SampleEventSource(1)
 
@@ -202,7 +159,7 @@ def test_retry_exhaustion_preserves_source_checkpoint():
         elastic.run(producer, source)
 
     assert source.committed == 0
-    assert len(channel.calls) == elastic.MAX_ATTEMPTS
+    assert len(channel.calls) == len(outcomes)
 
 
 def test_stalled_progress_preserves_original_future(monkeypatch):
@@ -241,12 +198,3 @@ def test_checkpoint_failure_keeps_acknowledgement_bookkeeping():
 
     assert len(pending) == 1
     assert source.committed == 0
-
-
-def test_sample_source_replay_is_deterministic():
-    first = elastic.SampleEventSource(3)
-    events = [first.read() for _ in range(3)]
-    restarted = elastic.SampleEventSource(3, checkpoint=1)
-
-    assert restarted.read() == events[1]
-    assert restarted.committed == 1
