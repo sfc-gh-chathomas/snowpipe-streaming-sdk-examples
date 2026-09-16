@@ -89,13 +89,7 @@ def run(producer: "ElasticProducer", source: "SampleEventSource") -> None:
         pending.append(append_event(producer, event, deadline))
 
 
-def collect_progress(
-    producer: "ElasticProducer",
-    pending: list["Pending"],
-    source: "SampleEventSource",
-    deadline: float,
-    wait: bool = False
-) -> None:
+def collect_progress(producer, pending: list["Pending"], source, deadline: float, wait: bool = False) -> None:
     """Checkpoint only the completed prefix; keep unfinished appends alive."""
     if not pending:
         return
@@ -136,12 +130,7 @@ def collect_progress(
         del pending[:confirmed]
 
 
-def append_event(
-    producer: "ElasticProducer",
-    event: "Event",
-    deadline: float,
-    retries: int = 0
-) -> "Pending":
+def append_event(producer: "ElasticProducer", event: "Event", deadline: float, retries: int = 0) -> "Pending":
     """Submit one retained event, retrying immediate transient failures."""
     attempt = retries
     while True:

@@ -129,11 +129,7 @@ def run(producer: "NamedProducer", source: SampleEventSource) -> None:
 
 # Committed offset handling
 
-def collect_progress(
-    producer: "NamedProducer",
-    submitted: int,
-    source: SampleEventSource
-) -> None:
+def collect_progress(producer: "NamedProducer", submitted: int, source: SampleEventSource) -> None:
     """Fetch status once and checkpoint the confirmed source prefix."""
     status = producer.channel.get_channel_status()
     if status.rows_error_count:

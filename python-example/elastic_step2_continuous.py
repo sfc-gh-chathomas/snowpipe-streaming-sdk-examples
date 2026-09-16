@@ -48,10 +48,7 @@ def collect_ready(pending: Deque[Future]) -> int:
     return confirmed
 
 
-def run(
-    channel: StreamingIngestElasticChannel,
-    rows: Iterable[tuple[int, dict[str, object]]]
-) -> int:
+def run(channel: StreamingIngestElasticChannel, rows: Iterable[tuple[int, dict[str, object]]]) -> int:
     pending = deque()
     confirmed = 0
 
