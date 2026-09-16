@@ -94,7 +94,7 @@ def collect_progress(
     pending: list["Pending"],
     source: "SampleEventSource",
     deadline: float,
-    wait: bool = False,
+    wait: bool = False
 ) -> None:
     """Checkpoint only the completed prefix; keep unfinished appends alive."""
     if not pending:
@@ -140,7 +140,7 @@ def append_event(
     producer: "ElasticProducer",
     event: "Event",
     deadline: float,
-    retries: int = 0,
+    retries: int = 0
 ) -> "Pending":
     """Submit one retained event, retrying immediate transient failures."""
     attempt = retries
