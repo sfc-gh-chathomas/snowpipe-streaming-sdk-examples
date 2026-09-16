@@ -56,9 +56,9 @@ def wait_and_remove_confirmed_prefix(pending: Deque[Future]) -> int:
     return confirmed
 
 
-def sample_rows(total: int) -> Iterator[tuple[int, Row]]:
+def sample_rows(total: int) -> Iterator[Row]:
     for event_id in range(1, total + 1):
-        yield event_id, {
+        yield {
             "EVENT_ID": event_id,
             "C1": event_id,
             "C2": f"event-{event_id}",
@@ -73,14 +73,14 @@ def main() -> None:
     completed = False
     try:
         channel = client.get_elastic_channel()
-        for event_id, row in sample_rows(total):
-            # This call returns immediately; its Future completes on durable acknowledgement.
-            # The token is opaque correlation data and does not define Elastic ordering.
-            pending.append(channel.append_row_with_wait(row, str(event_id)))
+        for row in sample_rows(total):
+            # None opts out of callback correlation; the Future identifies this append.
+            pending.append(channel.append_row_with_wait(row, None))
             if len(pending) >= MAX_PENDING_EVENTS:
                 # Pause source intake until at least one acknowledgement slot is released.
                 confirmed += wait_and_remove_confirmed_prefix(pending)
 
+        # End of input: wait until every accepted append is durably acknowledged.
         while pending:
             confirmed += wait_and_remove_confirmed_prefix(pending)
         completed = True

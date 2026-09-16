@@ -66,12 +66,12 @@ def test_main_bounds_pending_work(monkeypatch):
 
     continuous.main()
 
-    assert channel.calls == ["1", "2", "3", "4"]
+    assert channel.calls == [None, None, None, None]
     assert client.closes == [{"wait_for_flush": True, "timeout_seconds": 60}]
 
 
 def test_sample_rows_include_stable_event_ids():
     rows = list(continuous.sample_rows(2))
 
-    assert rows[0][1]["EVENT_ID"] == 1
-    assert rows[1][1]["EVENT_ID"] == 2
+    assert rows[0]["EVENT_ID"] == 1
+    assert rows[1]["EVENT_ID"] == 2
