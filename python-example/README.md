@@ -1,6 +1,6 @@
 # Python Snowpipe Streaming SDK Examples
 
-The Elastic examples build from one append to source-aware recovery. Read their
+The Elastic examples build from one append to retained-source error handling. Read their
 three steps in order. The named-channel example is an alternative for sources
 that need offset checkpointing. The SDK requirement is `snowpipe-streaming`
 **1.8.0 or later**.
@@ -11,7 +11,7 @@ that need offset checkpointing. The SDK requirement is `snowpipe-streaming`
 | --- | --- | --- |
 | Elastic 1 | [`elastic_step1_quickstart.py`](./elastic_step1_quickstart.py) | Create a table client, append one row, wait for durability, and close. |
 | Elastic 2 | [`elastic_step2_continuous.py`](./elastic_step2_continuous.py) | Keep appending, bound pending acknowledgements, collect ready work, and drain at shutdown. |
-| Elastic 3 | [`elastic_step3_recovery.py`](./elastic_step3_recovery.py) | Retain source events, checkpoint confirmed progress, retry transient failures, and swap an invalid client. |
+| Elastic 3 | [`elastic_step3_error_handling.py`](./elastic_step3_error_handling.py) | Retain source events, checkpoint confirmed progress, retry transient failures, and swap an invalid client. |
 | Named | [`named_channel_checkpoint.py`](./named_channel_checkpoint.py) | Use a stable channel and Snowflake's committed offset token to position a retained source after restart. |
 
 The original [`streaming_ingest_example.py`](./streaming_ingest_example.py) is
@@ -77,11 +77,11 @@ export SNOWFLAKE_TABLE=MY_TABLE
 ```bash
 python3 elastic_step1_quickstart.py
 python3 elastic_step2_continuous.py
-python3 elastic_step3_recovery.py
+python3 elastic_step3_error_handling.py
 python3 named_channel_checkpoint.py
 ```
 
-Set `SNOWFLAKE_TEST_ROWS` to change the generated row count. Elastic recovery
+Set `SNOWFLAKE_TEST_ROWS` to change the generated row count. Elastic step 3
 also accepts `SNOWFLAKE_SOURCE_CHECKPOINT`; named-channel recovery starts from
 the offset returned by Snowflake.
 
@@ -93,7 +93,7 @@ An Elastic acknowledgement confirms that Snowflake durably accepted the
 append. It does not confirm row validity or immediate table visibility. Check
 the target table and its error table separately.
 
-`elastic_step3_recovery.py` models a retained source with `SampleEventSource`.
+`elastic_step3_error_handling.py` models a retained source with `SampleEventSource`.
 Its data is regenerable and its checkpoint exists only in memory. Replace
 `read`, `acknowledge`, and `seek` with operations from your retained log,
 outbox, or source system.

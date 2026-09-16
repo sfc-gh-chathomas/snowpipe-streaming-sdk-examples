@@ -70,7 +70,7 @@ A complete Maven project demonstrating the Snowpipe Streaming SDK in Java. Inclu
 
 ### [Python Example](./python-example)
 A complete Python project demonstrating the Snowpipe Streaming SDK in Python. Includes:
-- Four examples progressing from one Elastic append through recovery and named-channel checkpointing
+- Three progressive Elastic examples plus a named-channel checkpointing alternative
 - Requirements file with all necessary packages
 - Clean, well-documented example code
 - Setup instructions with virtual environment

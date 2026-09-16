@@ -15,7 +15,7 @@ from typing import Optional
 
 from snowflake.ingest import streaming
 
-from elastic_step3_recovery import (
+from elastic_step3_error_handling import (
     MAX_ATTEMPTS,
     MAX_NO_PROGRESS_SECONDS,
     MAX_PENDING_EVENTS,

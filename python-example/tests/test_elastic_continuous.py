@@ -73,5 +73,5 @@ def test_main_bounds_pending_work(monkeypatch):
 def test_sample_rows_include_stable_event_ids():
     rows = list(continuous.sample_rows(2))
 
-    assert rows[0]["EVENT_ID"] == 1
-    assert rows[1]["EVENT_ID"] == 2
+    assert rows[0]["EVENT_ID"] == 0
+    assert rows[1]["EVENT_ID"] == 1

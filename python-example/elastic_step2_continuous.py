@@ -51,13 +51,14 @@ def wait_and_remove_confirmed_prefix(pending: Deque[Future]) -> int:
     confirmed = 0
     # One SDK acknowledgement may complete several consecutive append Futures.
     while pending and pending[0].done():
+        # Success only contributes to the count; failure raises here and stops the program.
         pending.popleft().result()
         confirmed += 1
     return confirmed
 
 
 def sample_rows(total: int) -> Iterator[Row]:
-    for event_id in range(1, total + 1):
+    for event_id in range(total):
         yield {
             "EVENT_ID": event_id,
             "C1": event_id,
@@ -67,6 +68,7 @@ def sample_rows(total: int) -> Iterator[Row]:
 
 def main() -> None:
     total = int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000"))
+    # If construction fails, no client exists to close; enter try only after it succeeds.
     client = create_client()
     pending = deque()
     confirmed = 0
@@ -74,7 +76,8 @@ def main() -> None:
     try:
         channel = client.get_elastic_channel()
         for row in sample_rows(total):
-            # None opts out of callback correlation; the Future identifies this append.
+            # The second argument is an optional token returned to success and error callbacks.
+            # This example observes each append through its Future, so it does not need a token.
             pending.append(channel.append_row_with_wait(row, None))
             if len(pending) >= MAX_PENDING_EVENTS:
                 # Pause source intake until at least one acknowledgement slot is released.
