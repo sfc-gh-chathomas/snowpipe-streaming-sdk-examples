@@ -1,5 +1,6 @@
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,9 +19,13 @@ def sdk_error(code, status=429):
 
 
 class Channel:
-    def __init__(self, outcomes=()):
+    def __init__(self, outcomes=(), async_errors=0):
         self.outcomes = list(outcomes)
         self.calls = []
+        self.accepted = []
+        self.async_errors = async_errors
+        self.success_handler = None
+        self.error_handler = None
 
     def append_row(self, row, token):
         self.calls.append(token)
@@ -28,6 +33,20 @@ class Channel:
             outcome = self.outcomes.pop(0)
             if outcome is not None:
                 raise outcome
+        self.accepted.append(token)
+
+    def set_success_handler(self, handler):
+        self.success_handler = handler
+
+    def set_error_handler(self, handler):
+        self.error_handler = handler
+
+    def complete(self):
+        split = len(self.accepted) - self.async_errors
+        if split and self.success_handler:
+            self.success_handler(SimpleNamespace(append_tokens=tuple(self.accepted[:split])))
+        if self.async_errors and self.error_handler:
+            self.error_handler(SimpleNamespace(append_tokens=tuple(self.accepted[split:])))
 
 
 class Client:
@@ -39,6 +58,7 @@ class Client:
         return self.channel
 
     def close(self, **options):
+        self.channel.complete()
         self.closes.append(options)
 
 
@@ -50,13 +70,19 @@ def run_main(monkeypatch, channel, total=3):
     return client
 
 
-def test_main_appends_without_waiting_and_flushes(monkeypatch):
+def event_ids(tokens):
+    return [token.event_id for token in tokens]
+
+
+def test_main_appends_without_waiting_and_logs_completion(monkeypatch, caplog):
     channel = Channel()
+    caplog.set_level("INFO", logger=continuous.logger.name)
 
     client = run_main(monkeypatch, channel)
 
-    assert channel.calls == ["1", "2", "3"]
+    assert event_ids(channel.calls) == [1, 2, 3]
     assert client.closes == [{"wait_for_flush": True, "timeout_seconds": 60}]
+    assert "accepted=3 acknowledged=3 errors=0 unreported=0" in caplog.text
 
 
 @pytest.mark.parametrize("code", continuous.SDK_BACKPRESSURE_ERRORS)
@@ -67,7 +93,7 @@ def test_main_pauses_and_retries_the_rejected_event(monkeypatch, code):
 
     run_main(monkeypatch, channel, total=2)
 
-    assert channel.calls == ["1", "2", "2"]
+    assert event_ids(channel.calls) == [1, 2, 2]
     assert sleeps == [continuous.BACKPRESSURE_RETRY_SECONDS]
 
 
@@ -78,7 +104,7 @@ def test_backpressure_does_not_have_an_attempt_limit(monkeypatch):
 
     run_main(monkeypatch, channel, total=1)
 
-    assert channel.calls == ["1"] * 11
+    assert event_ids(channel.calls) == [1] * 11
 
 
 def test_non_backpressure_error_propagates_after_flush(monkeypatch):
@@ -92,6 +118,15 @@ def test_non_backpressure_error_propagates_after_flush(monkeypatch):
         continuous.main()
 
     assert client.closes == [{"wait_for_flush": True, "timeout_seconds": 60}]
+
+
+def test_main_logs_asynchronous_error_count(monkeypatch, caplog):
+    channel = Channel(async_errors=1)
+    caplog.set_level("INFO", logger=continuous.logger.name)
+
+    run_main(monkeypatch, channel, total=2)
+
+    assert "accepted=2 acknowledged=1 errors=1 unreported=0" in caplog.text
 
 
 def test_sample_rows_include_stable_event_ids():
