@@ -55,9 +55,13 @@ def run(producer, source):
     while True:
         if pending:
             previous = source.committed
+            # Poll without waiting while there is capacity; wait only at the
+            # safety limit or after the source reaches its end.
             must_wait = exhausted or len(pending) >= MAX_PENDING_EVENTS
             collect_progress(producer, pending, source, deadline, wait=must_wait)
             if source.committed > previous:
+                # Successful submission is not progress; a durable source
+                # checkpoint is what resets the outage deadline.
                 deadline = time.monotonic() + MAX_NO_PROGRESS_SECONDS
 
         if exhausted and not pending:
@@ -78,6 +82,7 @@ def run(producer, source):
 
         if deadline is None:
             deadline = time.monotonic() + MAX_NO_PROGRESS_SECONDS
+        # The source still owns this event until collect_progress checkpoints it.
         pending.append(append_event(producer, event, deadline))
 
 
@@ -86,6 +91,8 @@ def collect_progress(producer, pending, source, deadline, wait=False):
     if not pending:
         return
 
+    # Later appends may finish first, but only the oldest one can extend the
+    # contiguous source checkpoint.
     first = pending[0]
     if wait and not first.future.done():
         try:
@@ -101,12 +108,14 @@ def collect_progress(producer, pending, source, deadline, wait=False):
             item.future.result()
         except StreamingIngestError as error:
             if confirmed:
+                # Commit the successful prefix before handling the failed append.
                 break
             if not retryable(error) or item.retries >= MAX_ATTEMPTS - 1:
                 raise
             if invalidation(error):
                 producer.swap_client(item.client)
             backoff(item.retries, deadline)
+            # Retry the same retained event on whichever client is active now.
             pending[0] = append_event(
                 producer, item.event, deadline, retries=item.retries + 1
             )
@@ -130,6 +139,8 @@ def append_event(producer, event, deadline, retries=0):
             return Pending(event, future, producer.client, attempt)
         except StreamingIngestError as error:
             if error.http_status_code == 429:
+                # An immediate 429 means the SDK rejected this append, so keep
+                # the event and wait for capacity without spending a retry.
                 backoff(2, deadline)
                 continue
             if not retryable(error) or attempt >= MAX_ATTEMPTS - 1:
@@ -240,6 +251,7 @@ class ElasticProducer:
 
     def swap_client(self, failed_client):
         """Replace the active client unless this failure came from an old one."""
+        # Several old Futures can report the same invalid client after a swap.
         if failed_client is not self.client:
             return
         self.close(False)

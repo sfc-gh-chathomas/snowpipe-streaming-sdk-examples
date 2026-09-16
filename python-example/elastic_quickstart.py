@@ -27,12 +27,14 @@ def create_client():
 def main():
     client = create_client()
     try:
+        # Elastic Channels belong to their client and are not closed separately.
         channel = client.get_elastic_channel()
         row = {
             "DATA": {"event_id": 1, "status": "active"},
             "C1": 1,
             "C2": "example",
         }
+        # The Future completes when Snowflake durably accepts this append.
         channel.append_row_with_wait(row, "event-1").result(timeout=60)
         print("Row durably acknowledged")
     finally:

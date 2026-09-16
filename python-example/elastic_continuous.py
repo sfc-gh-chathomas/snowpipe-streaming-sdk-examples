@@ -45,13 +45,16 @@ def run(channel, rows):
     confirmed = 0
 
     for offset, row in rows:
+        # Keep appends pipelined until the application's own safety limit is full.
         if len(pending) >= MAX_PENDING_EVENTS:
             pending[0].result()
             confirmed += collect_ready(pending)
 
+        # Keep the original Future; the SDK handles transport batching internally.
         pending.append(channel.append_row_with_wait(row, str(offset)))
         confirmed += collect_ready(pending)
 
+    # Intake has stopped, so wait for every accepted append before returning.
     while pending:
         pending[0].result()
         confirmed += collect_ready(pending)

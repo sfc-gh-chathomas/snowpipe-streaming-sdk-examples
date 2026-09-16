@@ -51,6 +51,7 @@ def main():
 
 def run(producer, source):
     """Append continuously and periodically checkpoint committed progress."""
+    # Snowflake's committed token determines where this retained source resumes.
     source.seek(producer.open())
     submitted = source.committed
     event = None
@@ -72,6 +73,8 @@ def run(producer, source):
             )
             if should_poll:
                 previous = source.committed
+                # One status call can confirm a partial prefix; it does not
+                # drain or wait for every submitted row.
                 collect_progress(producer, submitted, source)
                 if source.committed > previous:
                     deadline = time.monotonic() + MAX_NO_PROGRESS_SECONDS
@@ -163,6 +166,8 @@ class NamedProducer:
             self.close(False)
         elif self.channel is not None:
             try:
+                # Close only the local handle. Do not drop the named channel or
+                # replace its server-side committed offset.
                 self.channel.close(wait_for_flush=False, timeout_seconds=0)
             except StreamingIngestError:
                 pass
