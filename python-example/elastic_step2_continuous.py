@@ -37,8 +37,7 @@ def create_client() -> streaming.StreamingIngestClient:
     )
 
 
-def confirm_prefix(pending: Deque[Future]) -> int:
-    """Wait for the oldest append, then remove the completed prefix."""
+def wait_and_remove_confirmed_prefix(pending: Deque[Future]) -> int:
     pending[0].result()
     confirmed = 0
     while pending and pending[0].done():
@@ -51,7 +50,7 @@ def drain(pending: Deque[Future]) -> int:
     """Wait for all accepted appends."""
     confirmed = 0
     while pending:
-        confirmed += confirm_prefix(pending)
+        confirmed += wait_and_remove_confirmed_prefix(pending)
     return confirmed
 
 
@@ -65,7 +64,7 @@ def run(
         # Keep the original Future; the SDK handles transport batching internally.
         pending.append(channel.append_row_with_wait(row, str(offset)))
         if len(pending) >= MAX_PENDING_EVENTS:
-            confirmed += confirm_prefix(pending)
+            confirmed += wait_and_remove_confirmed_prefix(pending)
 
     return confirmed + drain(pending)
 
