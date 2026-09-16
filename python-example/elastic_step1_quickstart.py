@@ -1,7 +1,7 @@
 """Elastic step 1: append one row and wait for durability.
 
-Use this example to verify authentication and table configuration before
-building a continuous producer.
+This minimal example demonstrates authentication and table configuration with
+one durably acknowledged row.
 """
 
 import os
