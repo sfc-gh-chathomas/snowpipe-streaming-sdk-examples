@@ -1,9 +1,8 @@
 # Python Snowpipe Streaming SDK Examples
 
-The Elastic examples build from one append to production concerns. Read their
-three steps in order. The named-channel example is an alternative for sources
-that need offset checkpointing. The SDK requirement is `snowpipe-streaming`
-**1.8.0 or later**.
+The three Elastic examples progress from one append to production concerns.
+The named-channel example is an alternative for sources that need offset
+checkpointing. The SDK requirement is `snowpipe-streaming` **1.8.0 or later**.
 
 ## Examples
 

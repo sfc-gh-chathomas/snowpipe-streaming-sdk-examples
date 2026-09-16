@@ -62,6 +62,7 @@ This repository contains complete, runnable examples in multiple languages:
 
 ### [Java Example](./java-example)
 A complete Maven project demonstrating the Snowpipe Streaming SDK in Java. Includes:
+- Three progressive Elastic examples plus a named-channel checkpointing alternative
 - Maven build configuration with all required dependencies
 - Full example code with proper error handling
 - Comprehensive setup instructions
@@ -79,6 +80,7 @@ A complete Python project demonstrating the Snowpipe Streaming SDK in Python. In
 
 ### [Node.js Example](./nodejs-example)
 A complete Node.js project demonstrating the Snowpipe Streaming SDK in Node.js. Includes:
+- Three progressive Elastic examples plus a named-channel checkpointing alternative
 - npm package configuration with all required dependencies
 - Clean, well-documented example code
 - Setup instructions
