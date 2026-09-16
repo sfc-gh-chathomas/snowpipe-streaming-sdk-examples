@@ -7,10 +7,10 @@ run them in order. The SDK requirement is `snowpipe-streaming` **1.8.0 or later*
 
 | Step | File | What it adds |
 | --- | --- | --- |
-| 1 | [`elastic_quickstart.py`](./elastic_quickstart.py) | Create a table client, append one row, wait for durability, and close. |
-| 2 | [`elastic_continuous.py`](./elastic_continuous.py) | Keep appending, bound pending acknowledgements, collect ready work, and drain at shutdown. |
-| 3 | [`elastic_recovery.py`](./elastic_recovery.py) | Retain source events, checkpoint confirmed progress, retry transient failures, and swap an invalid client. |
-| 4 | [`named_channel_checkpoint.py`](./named_channel_checkpoint.py) | Use a stable named channel and Snowflake's committed offset token to position a retained source after restart. |
+| 1 | [`step1_elastic_quickstart.py`](./step1_elastic_quickstart.py) | Create a table client, append one row, wait for durability, and close. |
+| 2 | [`step2_elastic_continuous.py`](./step2_elastic_continuous.py) | Keep appending, bound pending acknowledgements, collect ready work, and drain at shutdown. |
+| 3 | [`step3_elastic_recovery.py`](./step3_elastic_recovery.py) | Retain source events, checkpoint confirmed progress, retry transient failures, and swap an invalid client. |
+| 4 | [`step4_named_channel_checkpoint.py`](./step4_named_channel_checkpoint.py) | Use a stable named channel and Snowflake's committed offset token to position a retained source after restart. |
 
 The fourth example is an alternative to Elastic Channels, not a stronger
 version of step three. Use named channels when your integration needs a stable
@@ -77,10 +77,10 @@ export SNOWFLAKE_TABLE=MY_TABLE
 ## Run
 
 ```bash
-python3 elastic_quickstart.py
-python3 elastic_continuous.py
-python3 elastic_recovery.py
-python3 named_channel_checkpoint.py
+python3 step1_elastic_quickstart.py
+python3 step2_elastic_continuous.py
+python3 step3_elastic_recovery.py
+python3 step4_named_channel_checkpoint.py
 ```
 
 Set `SNOWFLAKE_TEST_ROWS` to change the generated row count. Elastic recovery
@@ -95,7 +95,7 @@ An Elastic acknowledgement confirms that Snowflake durably accepted the
 append. It does not confirm row validity or immediate table visibility. Check
 the target table and its error table separately.
 
-`elastic_recovery.py` models a retained source with `SampleEventSource`.
+`step3_elastic_recovery.py` models a retained source with `SampleEventSource`.
 Its data is regenerable and its checkpoint exists only in memory. Replace
 `read`, `acknowledge`, and `seek` with operations from your retained log,
 outbox, or source system.

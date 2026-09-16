@@ -14,7 +14,7 @@ from snowflake.ingest.streaming import (
     StreamingIngestErrorCode,
 )
 
-from elastic_recovery import (
+from step3_elastic_recovery import (
     MAX_ATTEMPTS,
     MAX_NO_PROGRESS_SECONDS,
     MAX_PENDING_EVENTS,

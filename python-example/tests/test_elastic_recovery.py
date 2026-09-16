@@ -5,7 +5,7 @@ from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import elastic_recovery as elastic
+import step3_elastic_recovery as elastic
 from snowflake.ingest.streaming import StreamingIngestError, StreamingIngestErrorCode
 
 
