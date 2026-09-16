@@ -14,6 +14,8 @@ from typing import Optional
 
 from snowflake.ingest import streaming
 
+from elastic_step1_quickstart import connection_properties
+
 
 MAX_PENDING_EVENTS = 100_000
 MAX_NO_PROGRESS_SECONDS = 30 * 60.0
@@ -32,12 +34,14 @@ TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 # Connection and source model
 
 def create_client() -> streaming.StreamingIngestClient:
+    properties = connection_properties()
     return streaming.StreamingIngestClient.from_table(
         client_name=f"recovery-{os.getpid()}",
         db_name=os.environ.get("SNOWFLAKE_DATABASE", "MY_DATABASE"),
         schema_name=os.environ.get("SNOWFLAKE_SCHEMA", "MY_SCHEMA"),
         table_name=os.environ.get("SNOWFLAKE_TABLE", "MY_TABLE"),
-        profile_json=os.environ.get("SNOWFLAKE_PROFILE", "profile.json"),
+        profile_json=None if properties else os.environ.get("SNOWFLAKE_PROFILE", "profile.json"),
+        properties=properties,
     )
 
 

@@ -71,6 +71,10 @@ export SNOWFLAKE_SCHEMA=MY_SCHEMA
 export SNOWFLAKE_TABLE=MY_TABLE
 ```
 
+Alternatively, set `SNOWFLAKE_PAT`, `SNOWFLAKE_ACCOUNT`, and `SNOWFLAKE_URL`.
+`SNOWFLAKE_ROLE` is optional. The examples pass these values through
+`connection_properties()`.
+
 ## Run
 
 ```bash

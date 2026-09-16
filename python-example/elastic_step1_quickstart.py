@@ -5,6 +5,7 @@ one durably acknowledged row.
 """
 
 import os
+from typing import Optional
 import uuid
 
 os.environ.setdefault("SS_LOG_LEVEL", "warn")
@@ -18,13 +19,33 @@ TABLE = os.environ.get("SNOWFLAKE_TABLE", "MY_TABLE")
 PROFILE = os.environ.get("SNOWFLAKE_PROFILE", "profile.json")
 
 
+def connection_properties() -> Optional[dict[str, str]]:
+    pat = os.environ.get("SNOWFLAKE_PAT")
+    if not pat:
+        return None
+    if not os.environ.get("SNOWFLAKE_ACCOUNT") or not os.environ.get("SNOWFLAKE_URL"):
+        raise ValueError("PAT authentication requires SNOWFLAKE_ACCOUNT and SNOWFLAKE_URL")
+
+    properties = {
+        "authorization_type": "PAT",
+        "personal_access_token": pat,
+        "account": os.environ["SNOWFLAKE_ACCOUNT"],
+        "url": os.environ["SNOWFLAKE_URL"],
+    }
+    if os.environ.get("SNOWFLAKE_ROLE"):
+        properties["role"] = os.environ["SNOWFLAKE_ROLE"]
+    return properties
+
+
 def create_client() -> streaming.StreamingIngestClient:
+    properties = connection_properties()
     return streaming.StreamingIngestClient.from_table(
         client_name=f"quickstart-{uuid.uuid4()}",
         db_name=DATABASE,
         schema_name=SCHEMA,
         table_name=TABLE,
-        profile_json=PROFILE,
+        profile_json=None if properties else PROFILE,
+        properties=properties,
     )
 
 

@@ -25,6 +25,8 @@ os.environ.setdefault("SS_LOG_LEVEL", "warn")
 
 from snowflake.ingest import streaming
 
+from elastic_step1_quickstart import connection_properties
+
 
 MAX_PENDING_EVENTS = 10_000
 Row = dict[str, object]
@@ -35,12 +37,14 @@ PROFILE = os.environ.get("SNOWFLAKE_PROFILE", "profile.json")
 
 
 def create_client() -> streaming.StreamingIngestClient:
+    properties = connection_properties()
     return streaming.StreamingIngestClient.from_table(
         client_name=f"continuous-{uuid.uuid4()}",
         db_name=DATABASE,
         schema_name=SCHEMA,
         table_name=TABLE,
-        profile_json=PROFILE,
+        profile_json=None if properties else PROFILE,
+        properties=properties,
     )
 
 
