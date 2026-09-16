@@ -56,14 +56,6 @@ def wait_and_remove_confirmed_prefix(pending: Deque[Future]) -> int:
     return confirmed
 
 
-def drain(pending: Deque[Future]) -> int:
-    """Wait for all accepted appends."""
-    confirmed = 0
-    while pending:
-        confirmed += wait_and_remove_confirmed_prefix(pending)
-    return confirmed
-
-
 def sample_rows(total: int) -> Iterator[tuple[int, Row]]:
     for event_id in range(1, total + 1):
         yield event_id, {
@@ -89,7 +81,8 @@ def main() -> None:
                 # Pause source intake until at least one acknowledgement slot is released.
                 confirmed += wait_and_remove_confirmed_prefix(pending)
 
-        confirmed += drain(pending)
+        while pending:
+            confirmed += wait_and_remove_confirmed_prefix(pending)
         completed = True
         print(f"Durably acknowledged {confirmed} rows")
     finally:
