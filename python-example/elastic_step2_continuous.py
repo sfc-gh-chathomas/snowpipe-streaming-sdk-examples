@@ -60,9 +60,9 @@ def run(
     pending = deque()
     confirmed = 0
 
-    for offset, row in rows:
-        # Keep the original Future; the SDK handles transport batching internally.
-        pending.append(channel.append_row_with_wait(row, str(offset)))
+    for event_id, row in rows:
+        # The append token correlates the acknowledgement; Elastic does not order by it.
+        pending.append(channel.append_row_with_wait(row, str(event_id)))
         if len(pending) >= MAX_PENDING_EVENTS:
             confirmed += wait_and_remove_confirmed_prefix(pending)
 
@@ -70,11 +70,11 @@ def run(
 
 
 def sample_rows(total: int) -> Iterator[tuple[int, Row]]:
-    for offset in range(1, total + 1):
-        yield offset, {
-            "EVENT_ID": offset,
-            "C1": offset,
-            "C2": f"event-{offset}",
+    for event_id in range(1, total + 1):
+        yield event_id, {
+            "EVENT_ID": event_id,
+            "C1": event_id,
+            "C2": f"event-{event_id}",
         }
 
 
