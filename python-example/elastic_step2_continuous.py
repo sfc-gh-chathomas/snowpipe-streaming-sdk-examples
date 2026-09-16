@@ -4,6 +4,9 @@ The SDK batches rows for transport. This example submits individual rows,
 collects completed acknowledgements without waiting after every append, and
 blocks intake only when the application limit is full.
 
+The deque stores Future handles, not rows. Its limit bounds application
+acknowledgement bookkeeping independently of the SDK's byte-based buffer.
+
 This step does not retry failures or persist source progress. Step 3 adds
 those production concerns.
 """
@@ -38,8 +41,10 @@ def create_client() -> streaming.StreamingIngestClient:
 
 
 def wait_and_remove_confirmed_prefix(pending: Deque[Future]) -> int:
+    """Wait for the oldest append and remove the confirmed submission-order prefix."""
     pending[0].result()
     confirmed = 0
+    # One SDK acknowledgement may complete several consecutive append Futures.
     while pending and pending[0].done():
         pending.popleft().result()
         confirmed += 1
@@ -72,15 +77,18 @@ def main() -> None:
     try:
         channel = client.get_elastic_channel()
         for event_id, row in sample_rows(total):
-            # The append token correlates the acknowledgement; Elastic does not order by it.
+            # This call returns immediately; its Future completes on durable acknowledgement.
+            # The token is opaque correlation data and does not define Elastic ordering.
             pending.append(channel.append_row_with_wait(row, str(event_id)))
             if len(pending) >= MAX_PENDING_EVENTS:
+                # Pause source intake until at least one acknowledgement slot is released.
                 confirmed += wait_and_remove_confirmed_prefix(pending)
 
         confirmed += drain(pending)
         completed = True
         print(f"Durably acknowledged {confirmed} rows")
     finally:
+        # Success already drained every Future; after failure, close without waiting again.
         client.close(wait_for_flush=completed, timeout_seconds=60)
 
 
