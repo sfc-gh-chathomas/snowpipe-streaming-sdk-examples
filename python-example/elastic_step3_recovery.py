@@ -1,4 +1,4 @@
-"""3. Retain source events until Elastic acknowledgements confirm progress.
+"""Elastic step 3: retain source events until acknowledgements confirm progress.
 
 This adds source checkpointing, bounded retry, and client recovery to the
 continuous example. Replaying an Elastic append can create a duplicate, so a

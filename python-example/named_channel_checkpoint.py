@@ -1,4 +1,4 @@
-"""4. Coordinate retained source offsets with a named channel.
+"""Coordinate retained source offsets with a named channel.
 
 A named channel reports its latest committed offset token when opened and in
 channel status. The token is checkpoint metadata, not a deduplication key.
@@ -14,7 +14,7 @@ from snowflake.ingest.streaming import (
     StreamingIngestErrorCode,
 )
 
-from step3_elastic_recovery import (
+from elastic_step3_recovery import (
     MAX_ATTEMPTS,
     MAX_NO_PROGRESS_SECONDS,
     MAX_PENDING_EVENTS,

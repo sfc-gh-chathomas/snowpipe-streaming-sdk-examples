@@ -5,7 +5,7 @@ from concurrent.futures import Future
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import step2_elastic_continuous as continuous
+import elastic_step2_continuous as continuous
 
 
 def completed():

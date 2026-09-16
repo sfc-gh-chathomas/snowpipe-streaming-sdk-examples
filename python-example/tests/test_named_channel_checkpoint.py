@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import step4_named_channel_checkpoint as named
+import named_channel_checkpoint as named
 support = named
 from snowflake.ingest.streaming import StreamingIngestError, StreamingIngestErrorCode
 

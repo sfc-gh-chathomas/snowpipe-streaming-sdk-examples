@@ -1,4 +1,4 @@
-"""1. Append one row to an Elastic Channel and wait for durability."""
+"""Elastic step 1: append one row and wait for durability."""
 
 import os
 import uuid

@@ -1,4 +1,4 @@
-"""2. Keep appending while bounding unacknowledged application work.
+"""Elastic step 2: keep appending while bounding unacknowledged work.
 
 The SDK batches rows for transport. This example submits individual rows,
 collects completed acknowledgements without waiting after every append, and
