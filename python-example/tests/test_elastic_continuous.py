@@ -30,20 +30,43 @@ class Channel:
                 raise outcome
 
 
-def test_run_appends_without_waiting():
+class Client:
+    def __init__(self, channel):
+        self.channel = channel
+        self.closes = []
+
+    def get_elastic_channel(self):
+        return self.channel
+
+    def close(self, **options):
+        self.closes.append(options)
+
+
+def run_main(monkeypatch, channel, total=3):
+    client = Client(channel)
+    monkeypatch.setenv("SNOWFLAKE_TEST_ROWS", str(total))
+    monkeypatch.setattr(continuous, "create_client", lambda: client)
+    continuous.main()
+    return client
+
+
+def test_main_appends_without_waiting_and_flushes(monkeypatch):
     channel = Channel()
 
-    assert continuous.run(channel, continuous.sample_rows(3)) == 3
+    client = run_main(monkeypatch, channel)
+
     assert channel.calls == ["1", "2", "3"]
+    assert client.closes == [{"wait_for_flush": True, "timeout_seconds": 60}]
 
 
 @pytest.mark.parametrize("code", continuous.SDK_BACKPRESSURE_ERRORS)
-def test_run_pauses_and_retries_the_rejected_event(monkeypatch, code):
+def test_main_pauses_and_retries_the_rejected_event(monkeypatch, code):
     channel = Channel([None, sdk_error(code), None])
     sleeps = []
     monkeypatch.setattr(continuous.time, "sleep", sleeps.append)
 
-    assert continuous.run(channel, continuous.sample_rows(2)) == 2
+    run_main(monkeypatch, channel, total=2)
+
     assert channel.calls == ["1", "2", "2"]
     assert sleeps == [continuous.BACKPRESSURE_RETRY_SECONDS]
 
@@ -53,16 +76,22 @@ def test_backpressure_does_not_have_an_attempt_limit(monkeypatch):
     channel = Channel(errors + [None])
     monkeypatch.setattr(continuous.time, "sleep", lambda _: None)
 
-    assert continuous.run(channel, continuous.sample_rows(1)) == 1
+    run_main(monkeypatch, channel, total=1)
+
     assert channel.calls == ["1"] * 11
 
 
-def test_non_backpressure_error_propagates():
+def test_non_backpressure_error_propagates_after_flush(monkeypatch):
     error = sdk_error(streaming.StreamingIngestErrorCode.SF_API_USER_ERROR, 400)
     channel = Channel([error])
+    client = Client(channel)
+    monkeypatch.setenv("SNOWFLAKE_TEST_ROWS", "1")
+    monkeypatch.setattr(continuous, "create_client", lambda: client)
 
     with pytest.raises(streaming.StreamingIngestError):
-        continuous.run(channel, continuous.sample_rows(1))
+        continuous.main()
+
+    assert client.closes == [{"wait_for_flush": True, "timeout_seconds": 60}]
 
 
 def test_sample_rows_include_stable_event_ids():

@@ -11,7 +11,7 @@ delivery outcomes. Step 3 adds acknowledgement Futures and recovery.
 
 import os
 import time
-from typing import Iterable, Iterator
+from typing import Iterator
 import uuid
 
 os.environ.setdefault("SS_LOG_LEVEL", "warn")
@@ -42,25 +42,6 @@ def create_client() -> streaming.StreamingIngestClient:
     )
 
 
-def run(
-    channel: streaming.StreamingIngestElasticChannel, rows: Iterable[tuple[int, Row]]
-) -> int:
-    accepted = 0
-    for event_id, row in rows:
-        while True:
-            try:
-                # This call only enqueues; the SDK handles batching and delivery.
-                channel.append_row(row, str(event_id))
-                accepted += 1
-                break
-            except streaming.StreamingIngestError as error:
-                if error.error_code not in SDK_BACKPRESSURE_ERRORS:
-                    raise
-                # Backpressure means this event was not accepted. Retry it unchanged.
-                time.sleep(BACKPRESSURE_RETRY_SECONDS)
-    return accepted
-
-
 def sample_rows(total: int) -> Iterator[tuple[int, Row]]:
     for event_id in range(1, total + 1):
         yield event_id, {
@@ -73,8 +54,21 @@ def sample_rows(total: int) -> Iterator[tuple[int, Row]]:
 def main() -> None:
     total = int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000"))
     client = create_client()
+    accepted = 0
     try:
-        accepted = run(client.get_elastic_channel(), sample_rows(total))
+        channel = client.get_elastic_channel()
+        for event_id, row in sample_rows(total):
+            while True:
+                try:
+                    # This call only enqueues; the SDK handles batching and delivery.
+                    channel.append_row(row, str(event_id))
+                    accepted += 1
+                    break
+                except streaming.StreamingIngestError as error:
+                    if error.error_code not in SDK_BACKPRESSURE_ERRORS:
+                        raise
+                    # Backpressure means this event was not accepted. Retry it unchanged.
+                    time.sleep(BACKPRESSURE_RETRY_SECONDS)
     finally:
         # Flush every event accepted before normal completion or an exception.
         client.close(wait_for_flush=True, timeout_seconds=60)
