@@ -1,5 +1,8 @@
 """Coordinate retained source offsets with a named channel.
 
+This is an alternative to the Elastic progression for integrations that need
+a stable channel identity and source-offset checkpointing.
+
 A named channel reports its latest committed offset token when opened and in
 channel status. The token is checkpoint metadata, not a deduplication key.
 Give each stable channel name one owner and retain source events until its
@@ -32,6 +35,8 @@ CHANNEL_NAME = os.environ.get("SNOWFLAKE_CHANNEL", "production-source-0")
 CHECKPOINT_ROWS = 1_000
 CHECKPOINT_SECONDS = 5.0
 
+
+# Ingestion and status polling
 
 def main():
     source = SampleEventSource(
@@ -121,6 +126,8 @@ def run(producer, source):
             backoff(2, deadline)
 
 
+# Committed offset handling
+
 def collect_progress(producer, submitted, source):
     """Fetch status once and checkpoint the confirmed source prefix."""
     status = producer.channel.get_channel_status()
@@ -143,6 +150,8 @@ def parse_offset(token):
     """Decode this sample's numeric offset; application tokens may be opaque."""
     return 0 if token is None else int(token)
 
+
+# Channel lifecycle
 
 class NamedProducer:
     """Own one stable named channel and its client."""

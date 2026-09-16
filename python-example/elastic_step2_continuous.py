@@ -3,6 +3,9 @@
 The SDK batches rows for transport. This example submits individual rows,
 collects completed acknowledgements without waiting after every append, and
 blocks intake only when the application limit is full.
+
+This step does not retry failures or persist source progress. Step 3 adds
+those production concerns.
 """
 
 from collections import deque

@@ -28,6 +28,8 @@ INVALIDATION_ERRORS = {
 TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
+# Ingestion and checkpointing
+
 def main():
     source = SampleEventSource(
         total=int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000")),
@@ -151,6 +153,8 @@ def append_event(producer, event, deadline, retries=0):
             attempt += 1
 
 
+# Retry policy
+
 def invalidation(error):
     return error.error_code.value in INVALIDATION_ERRORS
 
@@ -174,6 +178,8 @@ def backoff(attempt, deadline):
     cap = min(10.0, 0.25 * 2 ** min(attempt, 6))
     time.sleep(min(random.uniform(0, cap), remaining(deadline)))
 
+
+# Connection and sample source
 
 def create_client():
     return StreamingIngestClient.from_table(
@@ -230,6 +236,8 @@ class Pending:
     client: object
     retries: int = 0
 
+
+# Client lifecycle
 
 class ElasticProducer:
     """Own the active client and its Elastic Channel."""

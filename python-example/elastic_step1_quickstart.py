@@ -1,4 +1,8 @@
-"""Elastic step 1: append one row and wait for durability."""
+"""Elastic step 1: append one row and wait for durability.
+
+Use this example to verify authentication and table configuration before
+building a continuous producer.
+"""
 
 import os
 import uuid
