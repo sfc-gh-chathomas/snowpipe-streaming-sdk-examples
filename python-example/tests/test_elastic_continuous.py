@@ -14,6 +14,28 @@ def completed():
     return future
 
 
+class Channel:
+    def __init__(self, outcomes=()):
+        self.outcomes = list(outcomes)
+        self.calls = []
+
+    def append_row_with_wait(self, row, token):
+        self.calls.append(token)
+        return self.outcomes.pop(0) if self.outcomes else completed()
+
+
+class Client:
+    def __init__(self, channel):
+        self.channel = channel
+        self.closes = []
+
+    def get_elastic_channel(self):
+        return self.channel
+
+    def close(self, **options):
+        self.closes.append(options)
+
+
 def test_wait_and_remove_stops_at_first_unfinished_append():
     second = Future()
     pending = continuous.deque([completed(), second, completed()])
@@ -25,26 +47,27 @@ def test_wait_and_remove_stops_at_first_unfinished_append():
     assert not pending
 
 
-def test_run_bounds_pending_work(monkeypatch):
+def test_main_bounds_pending_work(monkeypatch):
     monkeypatch.setattr(continuous, "MAX_PENDING_EVENTS", 3)
-    calls = []
 
     class ReleaseAtLimit(Future):
         def result(self, timeout=None):
             if not self.done():
-                assert len(calls) == 3
+                assert len(channel.calls) == 3
                 self.set_result(None)
             return super().result(timeout)
 
     outcomes = [ReleaseAtLimit(), completed(), completed(), completed()]
 
-    class Channel:
-        def append_row_with_wait(self, row, token):
-            calls.append(token)
-            return outcomes.pop(0)
+    channel = Channel(outcomes)
+    client = Client(channel)
+    monkeypatch.setenv("SNOWFLAKE_TEST_ROWS", "4")
+    monkeypatch.setattr(continuous, "create_client", lambda: client)
 
-    assert continuous.run(Channel(), continuous.sample_rows(4)) == 4
-    assert calls == ["1", "2", "3", "4"]
+    continuous.main()
+
+    assert channel.calls == ["1", "2", "3", "4"]
+    assert client.closes == [{"wait_for_flush": True, "timeout_seconds": 60}]
 
 
 def test_sample_rows_include_stable_event_ids():

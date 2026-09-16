@@ -11,7 +11,7 @@ those production concerns.
 from collections import deque
 from concurrent.futures import Future
 import os
-from typing import Deque, Iterable, Iterator
+from typing import Deque, Iterator
 import uuid
 
 os.environ.setdefault("SS_LOG_LEVEL", "warn")
@@ -54,21 +54,6 @@ def drain(pending: Deque[Future]) -> int:
     return confirmed
 
 
-def run(
-    channel: streaming.StreamingIngestElasticChannel, rows: Iterable[tuple[int, Row]]
-) -> int:
-    pending = deque()
-    confirmed = 0
-
-    for event_id, row in rows:
-        # The append token correlates the acknowledgement; Elastic does not order by it.
-        pending.append(channel.append_row_with_wait(row, str(event_id)))
-        if len(pending) >= MAX_PENDING_EVENTS:
-            confirmed += wait_and_remove_confirmed_prefix(pending)
-
-    return confirmed + drain(pending)
-
-
 def sample_rows(total: int) -> Iterator[tuple[int, Row]]:
     for event_id in range(1, total + 1):
         yield event_id, {
@@ -81,9 +66,18 @@ def sample_rows(total: int) -> Iterator[tuple[int, Row]]:
 def main() -> None:
     total = int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000"))
     client = create_client()
+    pending = deque()
+    confirmed = 0
     completed = False
     try:
-        confirmed = run(client.get_elastic_channel(), sample_rows(total))
+        channel = client.get_elastic_channel()
+        for event_id, row in sample_rows(total):
+            # The append token correlates the acknowledgement; Elastic does not order by it.
+            pending.append(channel.append_row_with_wait(row, str(event_id)))
+            if len(pending) >= MAX_PENDING_EVENTS:
+                confirmed += wait_and_remove_confirmed_prefix(pending)
+
+        confirmed += drain(pending)
         completed = True
         print(f"Durably acknowledged {confirmed} rows")
     finally:
