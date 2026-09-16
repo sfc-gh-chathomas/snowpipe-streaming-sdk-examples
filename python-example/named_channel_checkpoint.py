@@ -11,6 +11,7 @@ committed progress is confirmed.
 
 import os
 import time
+from typing import Optional
 
 from snowflake.ingest.streaming import (
     StreamingIngestError,
@@ -38,7 +39,7 @@ CHECKPOINT_SECONDS = 5.0
 
 # Ingestion and status polling
 
-def main():
+def main() -> None:
     source = SampleEventSource(
         total=int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000"))
     )
@@ -54,7 +55,7 @@ def main():
         producer.close(completed)
 
 
-def run(producer, source):
+def run(producer: "NamedProducer", source: SampleEventSource) -> None:
     """Append continuously and periodically checkpoint committed progress."""
     # Snowflake's committed token determines where this retained source resumes.
     source.seek(producer.open())
@@ -128,7 +129,11 @@ def run(producer, source):
 
 # Committed offset handling
 
-def collect_progress(producer, submitted, source):
+def collect_progress(
+    producer: "NamedProducer",
+    submitted: int,
+    source: SampleEventSource,
+) -> None:
     """Fetch status once and checkpoint the confirmed source prefix."""
     status = producer.channel.get_channel_status()
     if status.rows_error_count:
@@ -146,7 +151,7 @@ def collect_progress(producer, submitted, source):
         source.acknowledge(committed)
 
 
-def parse_offset(token):
+def parse_offset(token: Optional[str]) -> int:
     """Decode this sample's numeric offset; application tokens may be opaque."""
     return 0 if token is None else int(token)
 
@@ -161,7 +166,7 @@ class NamedProducer:
         self.client = None
         self.channel = None
 
-    def open(self):
+    def open(self) -> int:
         if self.client is None:
             self.client = self.factory()
         self.channel, status = self.client.open_channel(CHANNEL_NAME)
@@ -169,7 +174,7 @@ class NamedProducer:
             raise RuntimeError("Row errors require reconciliation before source handoff")
         return parse_offset(status.latest_committed_offset_token)
 
-    def recover(self, error):
+    def recover(self, error: StreamingIngestError) -> int:
         """Reopen the channel without replacing its committed offset."""
         if error.error_code.value == "InvalidClientError":
             self.close(False)
@@ -192,7 +197,7 @@ class NamedProducer:
             self.close(False)
             return self.open()
 
-    def close(self, flush):
+    def close(self, flush: bool) -> None:
         if self.client is None:
             return
         try:

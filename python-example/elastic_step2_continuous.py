@@ -9,12 +9,17 @@ those production concerns.
 """
 
 from collections import deque
+from concurrent.futures import Future
 import os
+from typing import Deque, Iterable, Iterator
 import uuid
 
 os.environ.setdefault("SS_LOG_LEVEL", "warn")
 
-from snowflake.ingest.streaming import StreamingIngestClient
+from snowflake.ingest.streaming import (
+    StreamingIngestClient,
+    StreamingIngestElasticChannel,
+)
 
 
 MAX_PENDING_EVENTS = 10_000
@@ -24,7 +29,7 @@ TABLE = os.environ.get("SNOWFLAKE_TABLE", "MY_TABLE")
 PROFILE = os.environ.get("SNOWFLAKE_PROFILE", "profile.json")
 
 
-def create_client():
+def create_client() -> StreamingIngestClient:
     return StreamingIngestClient.from_table(
         client_name=f"continuous-{uuid.uuid4()}",
         db_name=DATABASE,
@@ -34,7 +39,7 @@ def create_client():
     )
 
 
-def collect_ready(pending):
+def collect_ready(pending: Deque[Future]) -> int:
     """Remove and count the contiguous prefix of completed appends."""
     confirmed = 0
     while pending and pending[0].done():
@@ -43,7 +48,10 @@ def collect_ready(pending):
     return confirmed
 
 
-def run(channel, rows):
+def run(
+    channel: StreamingIngestElasticChannel,
+    rows: Iterable[tuple[int, dict[str, object]]],
+) -> int:
     pending = deque()
     confirmed = 0
 
@@ -65,7 +73,7 @@ def run(channel, rows):
     return confirmed
 
 
-def sample_rows(total):
+def sample_rows(total: int) -> Iterator[tuple[int, dict[str, object]]]:
     for offset in range(1, total + 1):
         yield offset, {
             "EVENT_ID": offset,
@@ -74,7 +82,7 @@ def sample_rows(total):
         }
 
 
-def main():
+def main() -> None:
     total = int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000"))
     client = create_client()
     completed = False

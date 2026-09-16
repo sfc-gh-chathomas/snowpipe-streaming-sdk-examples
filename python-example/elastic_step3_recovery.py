@@ -5,11 +5,12 @@ continuous example. Replaying an Elastic append can create a duplicate, so a
 real source must retain events and provide a stable event ID.
 """
 
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 import os
 import random
 import time
+from typing import Optional
 
 from snowflake.ingest.streaming import StreamingIngestClient, StreamingIngestError
 
@@ -30,7 +31,7 @@ TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 # Ingestion and checkpointing
 
-def main():
+def main() -> None:
     source = SampleEventSource(
         total=int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000")),
         checkpoint=int(os.environ.get("SNOWFLAKE_SOURCE_CHECKPOINT", "0")),
@@ -48,7 +49,7 @@ def main():
         producer.close(completed)
 
 
-def run(producer, source):
+def run(producer: "ElasticProducer", source: "SampleEventSource") -> None:
     """Submit while capacity is available and checkpoint confirmed prefixes."""
     pending = []
     exhausted = False
@@ -88,7 +89,13 @@ def run(producer, source):
         pending.append(append_event(producer, event, deadline))
 
 
-def collect_progress(producer, pending, source, deadline, wait=False):
+def collect_progress(
+    producer: "ElasticProducer",
+    pending: list["Pending"],
+    source: "SampleEventSource",
+    deadline: float,
+    wait: bool = False,
+) -> None:
     """Checkpoint only the completed prefix; keep unfinished appends alive."""
     if not pending:
         return
@@ -129,7 +136,12 @@ def collect_progress(producer, pending, source, deadline, wait=False):
         del pending[:confirmed]
 
 
-def append_event(producer, event, deadline, retries=0):
+def append_event(
+    producer: "ElasticProducer",
+    event: "Event",
+    deadline: float,
+    retries: int = 0,
+) -> "Pending":
     """Submit one retained event, retrying immediate transient failures."""
     attempt = retries
     while True:
@@ -155,17 +167,17 @@ def append_event(producer, event, deadline, retries=0):
 
 # Retry policy
 
-def invalidation(error):
+def invalidation(error: StreamingIngestError) -> bool:
     return error.error_code.value in INVALIDATION_ERRORS
 
 
-def retryable(error):
+def retryable(error: BaseException) -> bool:
     return isinstance(error, StreamingIngestError) and (
         invalidation(error) or error.http_status_code in TRANSIENT_STATUS_CODES
     )
 
 
-def remaining(deadline):
+def remaining(deadline: float) -> float:
     seconds = deadline - time.monotonic()
     if seconds <= 0:
         raise TimeoutError(
@@ -174,14 +186,14 @@ def remaining(deadline):
     return seconds
 
 
-def backoff(attempt, deadline):
+def backoff(attempt: int, deadline: float) -> None:
     cap = min(10.0, 0.25 * 2 ** min(attempt, 6))
     time.sleep(min(random.uniform(0, cap), remaining(deadline)))
 
 
 # Connection and sample source
 
-def create_client():
+def create_client() -> StreamingIngestClient:
     return StreamingIngestClient.from_table(
         client_name=f"recovery-{os.getpid()}",
         db_name=os.environ.get("SNOWFLAKE_DATABASE", "MY_DATABASE"),
@@ -194,20 +206,20 @@ def create_client():
 @dataclass(frozen=True)
 class Event:
     offset: int
-    row: dict
+    row: dict[str, object]
 
 
 class SampleEventSource:
     """Regenerable sample data with an in-memory, non-durable checkpoint."""
 
-    def __init__(self, total=10_000, checkpoint=0):
+    def __init__(self, total: int = 10_000, checkpoint: int = 0) -> None:
         if not 0 <= checkpoint <= total:
             raise ValueError("Require 0 <= checkpoint <= total")
         self.total = total
         self.committed = checkpoint
         self.next_offset = checkpoint + 1
 
-    def read(self):
+    def read(self) -> Optional[Event]:
         """Replace this with a non-destructive read from the retained source."""
         if self.next_offset > self.total:
             return None
@@ -218,13 +230,13 @@ class SampleEventSource:
             {"EVENT_ID": offset, "C1": offset, "C2": f"event-{offset}"},
         )
 
-    def acknowledge(self, offset):
+    def acknowledge(self, offset: int) -> None:
         """Replace this with the source's durable checkpoint operation."""
         if not self.committed <= offset <= self.total:
             raise ValueError("Invalid source checkpoint")
         self.committed = offset
 
-    def seek(self, committed):
+    def seek(self, committed: int) -> None:
         self.acknowledge(committed)
         self.next_offset = committed + 1
 
@@ -232,7 +244,7 @@ class SampleEventSource:
 @dataclass
 class Pending:
     event: Event
-    future: object
+    future: Future
     client: object
     retries: int = 0
 
@@ -247,7 +259,7 @@ class ElasticProducer:
         self.client = None
         self.channel = None
 
-    def open(self):
+    def open(self) -> None:
         client = self.factory()
         try:
             channel = client.get_elastic_channel()
@@ -257,7 +269,7 @@ class ElasticProducer:
         self.client = client
         self.channel = channel
 
-    def swap_client(self, failed_client):
+    def swap_client(self, failed_client: object) -> None:
         """Replace the active client unless this failure came from an old one."""
         # Several old Futures can report the same invalid client after a swap.
         if failed_client is not self.client:
@@ -265,7 +277,7 @@ class ElasticProducer:
         self.close(False)
         self.open()
 
-    def close(self, flush):
+    def close(self, flush: bool) -> None:
         if self.client is None:
             return
         try:

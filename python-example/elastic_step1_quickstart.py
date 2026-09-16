@@ -18,7 +18,7 @@ TABLE = os.environ.get("SNOWFLAKE_TABLE", "MY_TABLE")
 PROFILE = os.environ.get("SNOWFLAKE_PROFILE", "profile.json")
 
 
-def create_client():
+def create_client() -> StreamingIngestClient:
     return StreamingIngestClient.from_table(
         client_name=f"quickstart-{uuid.uuid4()}",
         db_name=DATABASE,
@@ -28,7 +28,7 @@ def create_client():
     )
 
 
-def main():
+def main() -> None:
     client = create_client()
     try:
         # Elastic Channels belong to their client and are not closed separately.
