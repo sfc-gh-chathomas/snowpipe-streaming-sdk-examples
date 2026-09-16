@@ -7,11 +7,11 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import named_channel_checkpoint as named
 support = named
-from snowflake.ingest.streaming import StreamingIngestError, StreamingIngestErrorCode
+from snowflake.ingest import streaming
 
 
 def error(code, status):
-    return StreamingIngestError(code, "synthetic", status, str(status))
+    return streaming.StreamingIngestError(code, "synthetic", status, str(status))
 
 
 class Channel:
@@ -72,7 +72,7 @@ def test_429_retains_current_event_without_reading_next():
     def pressure(offset):
         assert source.next_offset == offset + 1
         session.channel.on_append = None
-        raise error(StreamingIngestErrorCode.RECEIVER_SATURATED, 429)
+        raise error(streaming.StreamingIngestErrorCode.RECEIVER_SATURATED, 429)
 
     session.channel.on_append = pressure
     named.run(session, source)
@@ -81,8 +81,13 @@ def test_429_retains_current_event_without_reading_next():
     assert source.committed == 3
 
 
-@pytest.mark.parametrize("code", [StreamingIngestErrorCode.INVALID_CHANNEL_ERROR,
-                                  StreamingIngestErrorCode.CLOSED_CHANNEL_ERROR])
+@pytest.mark.parametrize(
+    "code",
+    [
+        streaming.StreamingIngestErrorCode.INVALID_CHANNEL_ERROR,
+        streaming.StreamingIngestErrorCode.CLOSED_CHANNEL_ERROR,
+    ],
+)
 def test_invalidation_replays_after_server_committed_record(code):
     session = Session()
 
@@ -118,10 +123,10 @@ def test_row_errors_prevent_source_handoff():
 
 def test_permanent_failure_preserves_checkpoint():
     session = Session()
-    auth_error = error(StreamingIngestErrorCode.SF_API_AUTH_ERROR, 403)
+    auth_error = error(streaming.StreamingIngestErrorCode.SF_API_AUTH_ERROR, 403)
     session.channel.on_append = lambda _: (_ for _ in ()).throw(auth_error)
     source = support.SampleEventSource(3)
-    with pytest.raises(StreamingIngestError):
+    with pytest.raises(streaming.StreamingIngestError):
         named.run(session, source)
     assert source.committed == 0
     assert session.channel.calls == [1]

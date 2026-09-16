@@ -13,10 +13,7 @@ import os
 import time
 from typing import Optional
 
-from snowflake.ingest.streaming import (
-    StreamingIngestError,
-    StreamingIngestErrorCode,
-)
+from snowflake.ingest import streaming
 
 from elastic_step3_recovery import (
     MAX_ATTEMPTS,
@@ -109,7 +106,7 @@ def run(producer: "NamedProducer", source: SampleEventSource) -> None:
             rows_since_poll += 1
             event = None
 
-        except StreamingIngestError as error:
+        except streaming.StreamingIngestError as error:
             if not retryable(error):
                 raise
             if error.http_status_code != 429:
@@ -135,8 +132,8 @@ def collect_progress(producer: "NamedProducer", submitted: int, source: SampleEv
     if status.rows_error_count:
         raise RuntimeError("Row errors require reconciliation before source handoff")
     if status.status_code != "SUCCESS":
-        raise StreamingIngestError(
-            StreamingIngestErrorCode.INVALID_CHANNEL_ERROR,
+        raise streaming.StreamingIngestError(
+            streaming.StreamingIngestErrorCode.INVALID_CHANNEL_ERROR,
             status.status_code,
             409,
             "Conflict",
@@ -170,7 +167,7 @@ class NamedProducer:
             raise RuntimeError("Row errors require reconciliation before source handoff")
         return parse_offset(status.latest_committed_offset_token)
 
-    def recover(self, error: StreamingIngestError) -> int:
+    def recover(self, error: streaming.StreamingIngestError) -> int:
         """Reopen the channel without replacing its committed offset."""
         if error.error_code.value == "InvalidClientError":
             self.close(False)
@@ -179,12 +176,12 @@ class NamedProducer:
                 # Close only the local handle. Do not drop the named channel or
                 # replace its server-side committed offset.
                 self.channel.close(wait_for_flush=False, timeout_seconds=0)
-            except StreamingIngestError:
+            except streaming.StreamingIngestError:
                 pass
 
         try:
             return self.open()
-        except StreamingIngestError as reopened:
+        except streaming.StreamingIngestError as reopened:
             if reopened.error_code.value not in {
                 "InvalidClientError",
                 "ClosedClientError",

@@ -16,21 +16,19 @@ import uuid
 
 os.environ.setdefault("SS_LOG_LEVEL", "warn")
 
-from snowflake.ingest.streaming import (
-    StreamingIngestClient,
-    StreamingIngestElasticChannel,
-)
+from snowflake.ingest import streaming
 
 
 MAX_PENDING_EVENTS = 10_000
+Row = dict[str, object]
 DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "MY_DATABASE")
 SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA", "MY_SCHEMA")
 TABLE = os.environ.get("SNOWFLAKE_TABLE", "MY_TABLE")
 PROFILE = os.environ.get("SNOWFLAKE_PROFILE", "profile.json")
 
 
-def create_client() -> StreamingIngestClient:
-    return StreamingIngestClient.from_table(
+def create_client() -> streaming.StreamingIngestClient:
+    return streaming.StreamingIngestClient.from_table(
         client_name=f"continuous-{uuid.uuid4()}",
         db_name=DATABASE,
         schema_name=SCHEMA,
@@ -48,7 +46,9 @@ def collect_ready(pending: Deque[Future]) -> int:
     return confirmed
 
 
-def run(channel: StreamingIngestElasticChannel, rows: Iterable[tuple[int, dict[str, object]]]) -> int:
+def run(
+    channel: streaming.StreamingIngestElasticChannel, rows: Iterable[tuple[int, Row]]
+) -> int:
     pending = deque()
     confirmed = 0
 
@@ -70,7 +70,7 @@ def run(channel: StreamingIngestElasticChannel, rows: Iterable[tuple[int, dict[s
     return confirmed
 
 
-def sample_rows(total: int) -> Iterator[tuple[int, dict[str, object]]]:
+def sample_rows(total: int) -> Iterator[tuple[int, Row]]:
     for offset in range(1, total + 1):
         yield offset, {
             "EVENT_ID": offset,

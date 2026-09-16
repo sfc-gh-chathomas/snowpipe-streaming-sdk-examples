@@ -12,7 +12,7 @@ import random
 import time
 from typing import Optional
 
-from snowflake.ingest.streaming import StreamingIngestClient, StreamingIngestError
+from snowflake.ingest import streaming
 
 
 MAX_PENDING_EVENTS = 100_000
@@ -89,7 +89,9 @@ def run(producer: "ElasticProducer", source: "SampleEventSource") -> None:
         pending.append(append_event(producer, event, deadline))
 
 
-def collect_progress(producer, pending: list["Pending"], source, deadline: float, wait: bool = False) -> None:
+def collect_progress(
+    producer, pending: list["Pending"], source, deadline: float, wait: bool = False
+) -> None:
     """Checkpoint only the completed prefix; keep unfinished appends alive."""
     if not pending:
         return
@@ -109,7 +111,7 @@ def collect_progress(producer, pending: list["Pending"], source, deadline: float
             break
         try:
             item.future.result()
-        except StreamingIngestError as error:
+        except streaming.StreamingIngestError as error:
             if confirmed:
                 # Commit the successful prefix before handling the failed append.
                 break
@@ -130,7 +132,9 @@ def collect_progress(producer, pending: list["Pending"], source, deadline: float
         del pending[:confirmed]
 
 
-def append_event(producer: "ElasticProducer", event: "Event", deadline: float, retries: int = 0) -> "Pending":
+def append_event(
+    producer: "ElasticProducer", event: "Event", deadline: float, retries: int = 0
+) -> "Pending":
     """Submit one retained event, retrying immediate transient failures."""
     attempt = retries
     while True:
@@ -140,7 +144,7 @@ def append_event(producer: "ElasticProducer", event: "Event", deadline: float, r
                 event.row, str(event.offset)
             )
             return Pending(event, future, producer.client, attempt)
-        except StreamingIngestError as error:
+        except streaming.StreamingIngestError as error:
             if error.http_status_code == 429:
                 # An immediate 429 means the SDK rejected this append, so keep
                 # the event and wait for capacity without spending a retry.
@@ -156,12 +160,12 @@ def append_event(producer: "ElasticProducer", event: "Event", deadline: float, r
 
 # Retry policy
 
-def invalidation(error: StreamingIngestError) -> bool:
+def invalidation(error: streaming.StreamingIngestError) -> bool:
     return error.error_code.value in INVALIDATION_ERRORS
 
 
 def retryable(error: BaseException) -> bool:
-    return isinstance(error, StreamingIngestError) and (
+    return isinstance(error, streaming.StreamingIngestError) and (
         invalidation(error) or error.http_status_code in TRANSIENT_STATUS_CODES
     )
 
@@ -182,8 +186,8 @@ def backoff(attempt: int, deadline: float) -> None:
 
 # Connection and sample source
 
-def create_client() -> StreamingIngestClient:
-    return StreamingIngestClient.from_table(
+def create_client() -> streaming.StreamingIngestClient:
+    return streaming.StreamingIngestClient.from_table(
         client_name=f"recovery-{os.getpid()}",
         db_name=os.environ.get("SNOWFLAKE_DATABASE", "MY_DATABASE"),
         schema_name=os.environ.get("SNOWFLAKE_SCHEMA", "MY_SCHEMA"),

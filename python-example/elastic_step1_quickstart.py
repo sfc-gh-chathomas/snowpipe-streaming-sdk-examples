@@ -9,7 +9,7 @@ import uuid
 
 os.environ.setdefault("SS_LOG_LEVEL", "warn")
 
-from snowflake.ingest.streaming import StreamingIngestClient
+from snowflake.ingest import streaming
 
 
 DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "MY_DATABASE")
@@ -18,8 +18,8 @@ TABLE = os.environ.get("SNOWFLAKE_TABLE", "MY_TABLE")
 PROFILE = os.environ.get("SNOWFLAKE_PROFILE", "profile.json")
 
 
-def create_client() -> StreamingIngestClient:
-    return StreamingIngestClient.from_table(
+def create_client() -> streaming.StreamingIngestClient:
+    return streaming.StreamingIngestClient.from_table(
         client_name=f"quickstart-{uuid.uuid4()}",
         db_name=DATABASE,
         schema_name=SCHEMA,

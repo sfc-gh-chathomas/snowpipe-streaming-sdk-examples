@@ -6,11 +6,11 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import elastic_step3_recovery as elastic
-from snowflake.ingest.streaming import StreamingIngestError, StreamingIngestErrorCode
+from snowflake.ingest import streaming
 
 
-def failure(code=StreamingIngestErrorCode.INVALID_CHANNEL_ERROR, status=409):
-    return StreamingIngestError(code, "synthetic", status, str(status))
+def failure(code=streaming.StreamingIngestErrorCode.INVALID_CHANNEL_ERROR, status=409):
+    return streaming.StreamingIngestError(code, "synthetic", status, str(status))
 
 
 def completed(error=None):
@@ -156,7 +156,7 @@ def test_late_errors_from_replaced_client_do_not_swap_twice():
 
 
 def test_immediate_429_retries_only_rejected_event():
-    pressure = failure(StreamingIngestErrorCode.RECEIVER_SATURATED, 429)
+    pressure = failure(streaming.StreamingIngestErrorCode.RECEIVER_SATURATED, 429)
     channel = Channel([completed(), pressure, completed()])
     producer, clients = producer_for(channel)
     source = elastic.SampleEventSource(2)
@@ -169,7 +169,7 @@ def test_immediate_429_retries_only_rejected_event():
 
 
 def test_429_backpressure_does_not_use_failure_attempts():
-    pressure = failure(StreamingIngestErrorCode.RECEIVER_SATURATED, 429)
+    pressure = failure(streaming.StreamingIngestErrorCode.RECEIVER_SATURATED, 429)
     channel = Channel([pressure] * 10 + [completed()])
     producer, _ = producer_for(channel)
     source = elastic.SampleEventSource(1)
@@ -182,23 +182,23 @@ def test_429_backpressure_does_not_use_failure_attempts():
 
 @pytest.mark.parametrize("status", [400, 401, 403, 404])
 def test_permanent_failure_preserves_source_checkpoint(status):
-    error = failure(StreamingIngestErrorCode.SF_API_USER_ERROR, status)
+    error = failure(streaming.StreamingIngestErrorCode.SF_API_USER_ERROR, status)
     producer, _ = producer_for(Channel([completed(error)]))
     source = elastic.SampleEventSource(1)
 
-    with pytest.raises(StreamingIngestError):
+    with pytest.raises(streaming.StreamingIngestError):
         elastic.run(producer, source)
 
     assert source.committed == 0
 
 
 def test_retry_exhaustion_preserves_source_checkpoint():
-    error = failure(StreamingIngestErrorCode.NON_FATAL, 503)
+    error = failure(streaming.StreamingIngestErrorCode.NON_FATAL, 503)
     channel = Channel([completed(error) for _ in range(elastic.MAX_ATTEMPTS)])
     producer, _ = producer_for(channel)
     source = elastic.SampleEventSource(1)
 
-    with pytest.raises(StreamingIngestError):
+    with pytest.raises(streaming.StreamingIngestError):
         elastic.run(producer, source)
 
     assert source.committed == 0
