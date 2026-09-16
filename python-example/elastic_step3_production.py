@@ -127,13 +127,13 @@ class ElasticProducer:
 
 # Retry policy
 
-def invalidation(error: streaming.StreamingIngestError) -> bool:
+def is_invalidation(error: streaming.StreamingIngestError) -> bool:
     return error.error_code.value in INVALIDATION_ERRORS
 
 
-def retryable(error: BaseException) -> bool:
+def is_retryable(error: BaseException) -> bool:
     return isinstance(error, streaming.StreamingIngestError) and (
-        invalidation(error) or error.http_status_code in TRANSIENT_STATUS_CODES
+        is_invalidation(error) or error.http_status_code in TRANSIENT_STATUS_CODES
     )
 
 
@@ -171,9 +171,9 @@ def append_event(
                 # the event and wait for capacity without spending a retry.
                 backoff(2, deadline)
                 continue
-            if not retryable(error) or attempt >= MAX_ATTEMPTS - 1:
+            if not is_retryable(error) or attempt >= MAX_ATTEMPTS - 1:
                 raise
-            if invalidation(error):
+            if is_invalidation(error):
                 producer.swap_client(producer.client)
             backoff(attempt, deadline)
             attempt += 1
@@ -205,9 +205,9 @@ def collect_progress(
             if confirmed:
                 # Commit the successful prefix before handling the failed append.
                 break
-            if not retryable(error) or item.retries >= MAX_ATTEMPTS - 1:
+            if not is_retryable(error) or item.retries >= MAX_ATTEMPTS - 1:
                 raise
-            if invalidation(error):
+            if is_invalidation(error):
                 producer.swap_client(item.client)
             backoff(item.retries, deadline)
             # Retry the same retained event on whichever client is active now.

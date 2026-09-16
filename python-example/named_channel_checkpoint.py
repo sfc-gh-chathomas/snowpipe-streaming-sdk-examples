@@ -23,9 +23,9 @@ from elastic_step3_production import (
     SampleEventSource,
     backoff,
     create_client,
-    invalidation,
+    is_invalidation,
     remaining,
-    retryable,
+    is_retryable,
 )
 
 
@@ -107,13 +107,13 @@ def run(producer: "NamedProducer", source: SampleEventSource) -> None:
             event = None
 
         except streaming.StreamingIngestError as error:
-            if not retryable(error):
+            if not is_retryable(error):
                 raise
             if error.http_status_code != 429:
                 failures += 1
                 if failures >= MAX_ATTEMPTS:
                     raise
-            if invalidation(error):
+            if is_invalidation(error):
                 previous = source.committed
                 source.seek(producer.recover(error))
                 if source.committed > previous:
