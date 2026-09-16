@@ -1,17 +1,18 @@
-"""Elastic step 2: keep appending while bounding unacknowledged work.
+"""Elastic step 2: let the SDK buffer continuous appends.
 
-The SDK batches rows for transport. This example submits individual rows,
-collects completed acknowledgements without waiting after every append, and
-blocks intake only when the application limit is full.
+The producer keeps appending while the SDK accepts work. A synchronous HTTP
+429 means the current event was not accepted, so this pull-based source pauses
+and retries that event before reading the next one.
 
-This step does not retry failures or persist source progress. Step 3 adds
-those production concerns.
+Acknowledgement Futures are retained only to observe delivery outcomes. This
+step does not retry asynchronous failures or persist source progress. Step 3
+adds those production concerns.
 """
 
-from collections import deque
 from concurrent.futures import Future
 import os
-from typing import Deque, Iterable, Iterator
+import time
+from typing import Iterable, Iterator
 import uuid
 
 os.environ.setdefault("SS_LOG_LEVEL", "warn")
@@ -19,7 +20,8 @@ os.environ.setdefault("SS_LOG_LEVEL", "warn")
 from snowflake.ingest import streaming
 
 
-MAX_PENDING_EVENTS = 10_000
+BACKPRESSURE_RETRY_SECONDS = 0.1
+COMPLETION_CHECK_INTERVAL = 1_000
 Row = dict[str, object]
 DATABASE = os.environ.get("SNOWFLAKE_DATABASE", "MY_DATABASE")
 SCHEMA = os.environ.get("SNOWFLAKE_SCHEMA", "MY_SCHEMA")
@@ -37,36 +39,51 @@ def create_client() -> streaming.StreamingIngestClient:
     )
 
 
-def wait_and_remove_confirmed_prefix(pending: Deque[Future]) -> int:
-    pending[0].result()
+def collect_completed(pending: list[Future]) -> int:
+    """Remove completed Futures and surface asynchronous failures."""
+    unfinished = []
     confirmed = 0
-    while pending and pending[0].done():
-        pending.popleft().result()
-        confirmed += 1
-    return confirmed
-
-
-def drain(pending: Deque[Future]) -> int:
-    """Wait for all accepted appends."""
-    confirmed = 0
-    while pending:
-        confirmed += wait_and_remove_confirmed_prefix(pending)
+    for future in pending:
+        if future.done():
+            future.result()
+            confirmed += 1
+        else:
+            unfinished.append(future)
+    pending[:] = unfinished
     return confirmed
 
 
 def run(
     channel: streaming.StreamingIngestElasticChannel, rows: Iterable[tuple[int, Row]]
 ) -> int:
-    pending = deque()
+    pending = []
     confirmed = 0
 
-    for event_id, row in rows:
-        # The append token correlates the acknowledgement; Elastic does not order by it.
-        pending.append(channel.append_row_with_wait(row, str(event_id)))
-        if len(pending) >= MAX_PENDING_EVENTS:
-            confirmed += wait_and_remove_confirmed_prefix(pending)
+    try:
+        for submitted, (event_id, row) in enumerate(rows, start=1):
+            while True:
+                try:
+                    # The token correlates the acknowledgement; Elastic does not order by it.
+                    future = channel.append_row_with_wait(row, str(event_id))
+                    pending.append(future)
+                    break
+                except streaming.StreamingIngestError as error:
+                    if error.http_status_code != 429:
+                        raise
+                    # The SDK did not accept this event. Pause intake and retry it unchanged.
+                    confirmed += collect_completed(pending)
+                    time.sleep(BACKPRESSURE_RETRY_SECONDS)
 
-    return confirmed + drain(pending)
+            if submitted % COMPLETION_CHECK_INTERVAL == 0:
+                confirmed += collect_completed(pending)
+
+        for future in pending:
+            future.result()
+            confirmed += 1
+        return confirmed
+    except Exception:
+        print(f"Durable acknowledgements before failure: at least {confirmed}")
+        raise
 
 
 def sample_rows(total: int) -> Iterator[tuple[int, Row]]:

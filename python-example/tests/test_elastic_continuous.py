@@ -6,45 +6,80 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import elastic_step2_continuous as continuous
+from snowflake.ingest import streaming
 
 
-def completed():
+def completed(error=None):
     future = Future()
-    future.set_result(None)
+    if error:
+        future.set_exception(error)
+    else:
+        future.set_result(None)
     return future
 
 
-def test_wait_and_remove_stops_at_first_unfinished_append():
-    second = Future()
-    pending = continuous.deque([completed(), second, completed()])
-
-    assert continuous.wait_and_remove_confirmed_prefix(pending) == 1
-
-    second.set_result(None)
-    assert continuous.wait_and_remove_confirmed_prefix(pending) == 2
-    assert not pending
+def backpressure():
+    return streaming.StreamingIngestError(
+        streaming.StreamingIngestErrorCode.RECEIVER_SATURATED,
+        "synthetic",
+        429,
+        "Too Many Requests",
+    )
 
 
-def test_run_bounds_pending_work(monkeypatch):
-    monkeypatch.setattr(continuous, "MAX_PENDING_EVENTS", 3)
+def test_collect_completed_removes_only_finished_futures():
+    unfinished = Future()
+    pending = [unfinished, completed()]
+
+    assert continuous.collect_completed(pending) == 1
+    assert pending == [unfinished]
+
+
+def test_run_pauses_and_retries_the_rejected_event(monkeypatch):
+    first = Future()
+    outcomes = [first, backpressure(), completed()]
     calls = []
-
-    class ReleaseAtLimit(Future):
-        def result(self, timeout=None):
-            if not self.done():
-                assert len(calls) == 3
-                self.set_result(None)
-            return super().result(timeout)
-
-    outcomes = [ReleaseAtLimit(), completed(), completed(), completed()]
 
     class Channel:
         def append_row_with_wait(self, row, token):
             calls.append(token)
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(continuous.time, "sleep", lambda _: first.set_result(None))
+
+    assert continuous.run(Channel(), continuous.sample_rows(2)) == 2
+    assert calls == ["1", "2", "2"]
+
+
+def test_429_backpressure_does_not_have_an_attempt_limit(monkeypatch):
+    outcomes = [backpressure()] * 10 + [completed()]
+
+    class Channel:
+        def append_row_with_wait(self, row, token):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(continuous.time, "sleep", lambda _: None)
+
+    assert continuous.run(Channel(), continuous.sample_rows(1)) == 1
+
+
+def test_run_reports_confirmed_rows_before_late_failure(capsys):
+    outcomes = [completed(), completed(RuntimeError("late failure"))]
+
+    class Channel:
+        def append_row_with_wait(self, row, token):
             return outcomes.pop(0)
 
-    assert continuous.run(Channel(), continuous.sample_rows(4)) == 4
-    assert calls == ["1", "2", "3", "4"]
+    with pytest.raises(RuntimeError, match="late failure"):
+        continuous.run(Channel(), continuous.sample_rows(2))
+
+    assert "at least 1" in capsys.readouterr().out
 
 
 def test_sample_rows_include_stable_event_ids():

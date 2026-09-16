@@ -10,7 +10,7 @@ that need offset checkpointing. The SDK requirement is `snowpipe-streaming`
 | Path | File | What it adds |
 | --- | --- | --- |
 | Elastic 1 | [`elastic_step1_quickstart.py`](./elastic_step1_quickstart.py) | Create a table client, append one row, wait for durability, and close. |
-| Elastic 2 | [`elastic_step2_continuous.py`](./elastic_step2_continuous.py) | Keep appending, bound pending acknowledgements, collect ready work, and drain at shutdown. |
+| Elastic 2 | [`elastic_step2_continuous.py`](./elastic_step2_continuous.py) | Keep appending, pause on SDK backpressure, observe acknowledgements, and drain at shutdown. |
 | Elastic 3 | [`elastic_step3_recovery.py`](./elastic_step3_recovery.py) | Retain source events, checkpoint confirmed progress, retry transient failures, and swap an invalid client. |
 | Named | [`named_channel_checkpoint.py`](./named_channel_checkpoint.py) | Use a stable channel and Snowflake's committed offset token to position a retained source after restart. |
 
@@ -92,6 +92,11 @@ the offset returned by Snowflake.
 An Elastic acknowledgement confirms that Snowflake durably accepted the
 append. It does not confirm row validity or immediate table visibility. Check
 the target table and its error table separately.
+
+`elastic_step2_continuous.py` relies on SDK byte and memory limits for flow
+control. When an append is rejected with HTTP 429, it pauses without reading
+another event and retries the same event. Its Future list tracks delivery
+outcomes; it does not hold a second copy of the rows.
 
 `elastic_step3_recovery.py` models a retained source with `SampleEventSource`.
 Its data is regenerable and its checkpoint exists only in memory. Replace
