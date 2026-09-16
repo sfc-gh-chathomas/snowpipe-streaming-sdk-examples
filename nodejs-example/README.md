@@ -29,7 +29,7 @@ Requires **snowpipe-streaming >= 1.8.0** and Node.js >= 20.
 |------|------|-------------|
 | Elastic Channel (quickstart) | `elastic_quickstart.js` | New applications. Easiest to get started; Snowflake manages scaling and channel lifecycle. Delivery is at-least-once and unordered. |
 | Elastic Channel (production) | `elastic_production.js` | Production workloads. Adds bounded durability checkpoints, retry, client recreation, and graceful shutdown. |
-| Named channel (checkpoint) | `named_channel_checkpoint.js` | Strict exactly-once ingestion, ordered delivery within a channel, or explicit source-offset recovery after a restart. |
+| Named channel (checkpoint) | `named_channel_checkpoint.js` | Stable channel ownership, ordered ingestion, and explicit source-offset recovery after a restart. |
 
 The legacy `streaming_ingest_example.js` (named-channel pattern) is preserved for reference.
 
@@ -132,7 +132,7 @@ Otherwise `profile.json` or `SNOWFLAKE_PROFILE` is used. Account/role defaults a
 
 ### `named_channel_checkpoint.js`
 
-Demonstrates the named-channel pattern for strict exactly-once ingestion:
+Demonstrates the named-channel pattern for source-offset checkpointing:
 
 - Opens a stable, exclusively owned channel without replacing its server offset and seeks after committed progress.
 - Appends each event with `appendRow`; the SDK buffers and batches it internally.

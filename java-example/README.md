@@ -34,7 +34,7 @@ SDK requirement: `snowpipe-streaming` **1.8.0** or later.
 
 **Channel mode guidance:**
 - Use **Elastic Channels** for most new applications. They scale automatically across concurrent producers and require no offset management.
-- Use **named channels** when you need ordered, strictly-exactly-once delivery or source-offset integration (for example, Kafka partition offset tracking).
+- Use **named channels** when you need stable channel ownership, ordered ingestion, or source-offset integration (for example, Kafka partition offset tracking).
 
 ## Prerequisites
 

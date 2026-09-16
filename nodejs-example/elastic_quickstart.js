@@ -4,8 +4,8 @@
  *
  * Elastic Channels are the recommended starting point for most applications.
  * Snowflake manages scaling and channel lifecycle; delivery is at-least-once
- * and unordered. For strict exactly-once ingestion with explicit source-offset
- * tracking, see named_channel_checkpoint.js.
+ * and unordered. For a stable channel with explicit source-offset tracking,
+ * see named_channel_checkpoint.js.
  *
  * Requirements: snowpipe-streaming >= 1.8.0, Node.js >= 20
  */

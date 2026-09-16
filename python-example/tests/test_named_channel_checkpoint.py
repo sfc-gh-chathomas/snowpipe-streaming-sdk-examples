@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import named_channel_checkpoint_example as named
+import named_channel_checkpoint as named
 support = named
 from snowflake.ingest.streaming import StreamingIngestError, StreamingIngestErrorCode
 
@@ -118,7 +118,8 @@ def test_row_errors_prevent_source_handoff():
 
 def test_permanent_failure_preserves_checkpoint():
     session = Session()
-    session.channel.on_append = lambda _: (_ for _ in ()).throw(error(StreamingIngestErrorCode.SF_API_AUTH_ERROR, 403))
+    auth_error = error(StreamingIngestErrorCode.SF_API_AUTH_ERROR, 403)
+    session.channel.on_append = lambda _: (_ for _ in ()).throw(auth_error)
     source = support.SampleEventSource(3)
     with pytest.raises(StreamingIngestError):
         named.run(session, source)
