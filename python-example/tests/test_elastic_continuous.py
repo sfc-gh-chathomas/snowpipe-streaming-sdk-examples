@@ -1,6 +1,5 @@
 import os
 import sys
-from concurrent.futures import Future
 
 import pytest
 
@@ -9,77 +8,61 @@ import elastic_step2_continuous as continuous
 from snowflake.ingest import streaming
 
 
-def completed(error=None):
-    future = Future()
-    if error:
-        future.set_exception(error)
-    else:
-        future.set_result(None)
-    return future
-
-
-def backpressure():
+def sdk_error(code, status=429):
     return streaming.StreamingIngestError(
-        streaming.StreamingIngestErrorCode.RECEIVER_SATURATED,
+        code,
         "synthetic",
-        429,
-        "Too Many Requests",
+        status,
+        "synthetic",
     )
 
 
-def test_collect_completed_removes_only_finished_futures():
-    unfinished = Future()
-    pending = [unfinished, completed()]
+class Channel:
+    def __init__(self, outcomes=()):
+        self.outcomes = list(outcomes)
+        self.calls = []
 
-    assert continuous.collect_completed(pending) == 1
-    assert pending == [unfinished]
-
-
-def test_run_pauses_and_retries_the_rejected_event(monkeypatch):
-    first = Future()
-    outcomes = [first, backpressure(), completed()]
-    calls = []
-
-    class Channel:
-        def append_row_with_wait(self, row, token):
-            calls.append(token)
-            outcome = outcomes.pop(0)
-            if isinstance(outcome, Exception):
+    def append_row(self, row, token):
+        self.calls.append(token)
+        if self.outcomes:
+            outcome = self.outcomes.pop(0)
+            if outcome is not None:
                 raise outcome
-            return outcome
-
-    monkeypatch.setattr(continuous.time, "sleep", lambda _: first.set_result(None))
-
-    assert continuous.run(Channel(), continuous.sample_rows(2)) == 2
-    assert calls == ["1", "2", "2"]
 
 
-def test_429_backpressure_does_not_have_an_attempt_limit(monkeypatch):
-    outcomes = [backpressure()] * 10 + [completed()]
+def test_run_appends_without_waiting():
+    channel = Channel()
 
-    class Channel:
-        def append_row_with_wait(self, row, token):
-            outcome = outcomes.pop(0)
-            if isinstance(outcome, Exception):
-                raise outcome
-            return outcome
+    assert continuous.run(channel, continuous.sample_rows(3)) == 3
+    assert channel.calls == ["1", "2", "3"]
 
+
+@pytest.mark.parametrize("code", continuous.SDK_BACKPRESSURE_ERRORS)
+def test_run_pauses_and_retries_the_rejected_event(monkeypatch, code):
+    channel = Channel([None, sdk_error(code), None])
+    sleeps = []
+    monkeypatch.setattr(continuous.time, "sleep", sleeps.append)
+
+    assert continuous.run(channel, continuous.sample_rows(2)) == 2
+    assert channel.calls == ["1", "2", "2"]
+    assert sleeps == [continuous.BACKPRESSURE_RETRY_SECONDS]
+
+
+def test_backpressure_does_not_have_an_attempt_limit(monkeypatch):
+    errors = [sdk_error(streaming.StreamingIngestErrorCode.RECEIVER_SATURATED)] * 10
+    channel = Channel(errors + [None])
     monkeypatch.setattr(continuous.time, "sleep", lambda _: None)
 
-    assert continuous.run(Channel(), continuous.sample_rows(1)) == 1
+    assert continuous.run(channel, continuous.sample_rows(1)) == 1
+    assert channel.calls == ["1"] * 11
 
 
-def test_run_reports_confirmed_rows_before_late_failure(capsys):
-    outcomes = [completed(), completed(RuntimeError("late failure"))]
+def test_non_backpressure_error_propagates():
+    error = sdk_error(streaming.StreamingIngestErrorCode.SF_API_USER_ERROR, 400)
+    channel = Channel([error])
 
-    class Channel:
-        def append_row_with_wait(self, row, token):
-            return outcomes.pop(0)
-
-    with pytest.raises(RuntimeError, match="late failure"):
-        continuous.run(Channel(), continuous.sample_rows(2))
-
-    assert "at least 1" in capsys.readouterr().out
+    with pytest.raises(streaming.StreamingIngestError):
+        continuous.run(channel, continuous.sample_rows(1))
 
 
 def test_sample_rows_include_stable_event_ids():
