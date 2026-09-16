@@ -13,7 +13,7 @@ Step 3 adds acknowledgement Futures and recovery.
 from dataclasses import dataclass
 import logging
 import os
-from queue import Empty, SimpleQueue
+import queue
 import time
 from typing import Iterator
 import uuid
@@ -55,12 +55,14 @@ def create_client() -> streaming.StreamingIngestClient:
     )
 
 
-def log_completion_stats(accepted: int, successes: SimpleQueue, error_counts: SimpleQueue) -> None:
+def log_completion_stats(
+    accepted: int, successes: queue.SimpleQueue, error_counts: queue.SimpleQueue
+) -> None:
     latencies_ms = []
     while True:
         try:
             acknowledged_at, tokens = successes.get_nowait()
-        except Empty:
+        except queue.Empty:
             break
         latencies_ms.extend(
             (acknowledged_at - token.submitted_at) * 1_000 for token in tokens
@@ -70,7 +72,7 @@ def log_completion_stats(accepted: int, successes: SimpleQueue, error_counts: Si
     while True:
         try:
             errors += error_counts.get_nowait()
-        except Empty:
+        except queue.Empty:
             break
 
     acknowledged = len(latencies_ms)
@@ -101,8 +103,8 @@ def sample_rows(total: int) -> Iterator[tuple[int, Row]]:
 def main() -> None:
     total = int(os.environ.get("SNOWFLAKE_TEST_ROWS", "10000"))
     client = create_client()
-    successes = SimpleQueue()
-    error_counts = SimpleQueue()
+    successes = queue.SimpleQueue()
+    error_counts = queue.SimpleQueue()
     accepted = 0
 
     def record_success(detail: streaming.SuccessDetail) -> None:
