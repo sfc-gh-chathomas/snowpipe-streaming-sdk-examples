@@ -14,14 +14,14 @@ def completed():
     return future
 
 
-def test_collect_ready_stops_at_first_unfinished_append():
-    first = Future()
-    pending = continuous.deque([first, completed()])
+def test_confirm_prefix_stops_at_first_unfinished_append():
+    second = Future()
+    pending = continuous.deque([completed(), second, completed()])
 
-    assert continuous.collect_ready(pending) == 0
+    assert continuous.confirm_prefix(pending) == 1
 
-    first.set_result(None)
-    assert continuous.collect_ready(pending) == 2
+    second.set_result(None)
+    assert continuous.confirm_prefix(pending) == 2
     assert not pending
 
 

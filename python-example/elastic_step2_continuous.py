@@ -37,12 +37,21 @@ def create_client() -> streaming.StreamingIngestClient:
     )
 
 
-def collect_ready(pending: Deque[Future]) -> int:
-    """Remove and count the contiguous prefix of completed appends."""
+def confirm_prefix(pending: Deque[Future]) -> int:
+    """Wait for the oldest append, then remove the completed prefix."""
+    pending[0].result()
     confirmed = 0
     while pending and pending[0].done():
         pending.popleft().result()
         confirmed += 1
+    return confirmed
+
+
+def drain(pending: Deque[Future]) -> int:
+    """Wait for all accepted appends."""
+    confirmed = 0
+    while pending:
+        confirmed += confirm_prefix(pending)
     return confirmed
 
 
@@ -53,21 +62,12 @@ def run(
     confirmed = 0
 
     for offset, row in rows:
-        # Keep appends pipelined until the application's own safety limit is full.
-        if len(pending) >= MAX_PENDING_EVENTS:
-            pending[0].result()
-            confirmed += collect_ready(pending)
-
         # Keep the original Future; the SDK handles transport batching internally.
         pending.append(channel.append_row_with_wait(row, str(offset)))
-        confirmed += collect_ready(pending)
+        if len(pending) >= MAX_PENDING_EVENTS:
+            confirmed += confirm_prefix(pending)
 
-    # Intake has stopped, so wait for every accepted append before returning.
-    while pending:
-        pending[0].result()
-        confirmed += collect_ready(pending)
-
-    return confirmed
+    return confirmed + drain(pending)
 
 
 def sample_rows(total: int) -> Iterator[tuple[int, Row]]:
