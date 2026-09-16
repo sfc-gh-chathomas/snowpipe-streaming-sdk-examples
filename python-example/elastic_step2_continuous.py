@@ -7,8 +7,12 @@ blocks intake only when the application limit is full.
 The deque stores Future handles, not rows. Its limit bounds application
 acknowledgement bookkeeping independently of the SDK's byte-based buffer.
 
-This step does not retry failures or persist source progress. Step 3 adds
-those production concerns.
+The SDK retries transient network and service failures internally. This
+example does not retry errors that still reach the caller: invalid input,
+local backpressure, closed or invalid SDK state, non-retryable API errors, or
+exhausted SDK retries. Later row-materialization errors are separate from
+append acknowledgement and must be monitored separately. Step 3 adds
+application retries and persisted source progress.
 """
 
 from collections import deque
@@ -42,6 +46,7 @@ def create_client() -> streaming.StreamingIngestClient:
 
 def wait_and_remove_confirmed_prefix(pending: Deque[Future]) -> int:
     """Wait for the oldest append and remove the confirmed submission-order prefix."""
+    # An exceptional result is terminal from the SDK's perspective; this step propagates it.
     pending[0].result()
     confirmed = 0
     # One SDK acknowledgement may complete several consecutive append Futures.
