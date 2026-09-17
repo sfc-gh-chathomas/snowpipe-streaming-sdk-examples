@@ -27,10 +27,15 @@ import java.util.concurrent.TimeoutException;
  * replacement follow the same rules.
  */
 final class ElasticStep3 {
+    // Application limits, not SDK defaults. 100k is an event-count cap, not a byte cap.
     static final int MAX_PENDING_EVENTS = 100_000;
+    // Replay budget for a failed append. HTTP 429 is backpressure and does not count.
     static final int MAX_ATTEMPTS = 6;
+    // While intake is paused, wake this often to collect acks instead of spinning.
     static final long POLL_NANOS = TimeUnit.SECONDS.toNanos(1);
+    // Abort if the source checkpoint does not move. A successful submit does not reset this.
     static final long MAX_NO_PROGRESS_NANOS = TimeUnit.MINUTES.toNanos(30);
+    // The local client/channel handle is dead. Ordinary 429/5xx are not this.
     static final List<String> INVALIDATION_ERRORS = List.of(
             "InvalidChannelError",
             "InvalidClientError",
@@ -51,6 +56,7 @@ final class ElasticStep3 {
                 Paths.get(env("SNOWFLAKE_PROFILE", "profile.json"))));
         profile.fields().forEachRemaining(
                 entry -> properties.put(entry.getKey(), entry.getValue().asText()));
+        // Client name is a local label. Pid keeps two example processes distinct.
         return SnowflakeStreamingIngestClientFactory.tableBuilder(
                 "elastic-step3-" + ProcessHandle.current().pid(),
                 env("SNOWFLAKE_DATABASE", "MY_DATABASE"),
@@ -60,7 +66,11 @@ final class ElasticStep3 {
                 .build();
     }
 
-    /** One retained source event. {@code EVENT_ID} is stable across replays. */
+    /**
+     * One retained source event. {@code position} is the checkpoint offset;
+     * {@code EVENT_ID} is the stable row id if this append is replayed.
+     * They match in this sample; a real source may use a different id.
+     */
     static final class Event {
         final long position;
         final Map<String, Object> row;
@@ -93,6 +103,7 @@ final class ElasticStep3 {
             }
             this.total = total;
             this.committed = checkpoint;
+            // Checkpoint 0 means nothing durable yet, so the first event is 1.
             this.next = checkpoint + 1;
         }
 
@@ -104,14 +115,18 @@ final class ElasticStep3 {
             if (position < committed || position > total) {
                 throw new IllegalArgumentException("Checkpoints may only move forward");
             }
+            // Assign only after a real persist would succeed; a failed write must leave
+            // the previous checkpoint authoritative.
             committed = position;
         }
     }
 
+    /** Tests inject a fake; {@code main} passes {@code ElasticStep3::createClient}. */
     interface ClientFactory {
         SnowflakeStreamingIngestClient create() throws Exception;
     }
 
+    /** Live handles. {@link #reopen} mutates this so the ingest loop keeps one reference. */
     static final class Session {
         SnowflakeStreamingIngestClient client;
         SnowflakeStreamingIngestElasticChannel channel;
@@ -126,6 +141,8 @@ final class ElasticStep3 {
             session.channel = client.getElasticChannel();
             return session;
         } catch (Exception error) {
+            // Channel open can fail after the client exists. Close without flush:
+            // this handle never became the live ingest session.
             if (client != null) {
                 try {
                     closeClient(client, false);
@@ -137,17 +154,15 @@ final class ElasticStep3 {
         }
     }
 
-    static Session replace(
-            ClientFactory factory,
-            Session current,
-            SnowflakeStreamingIngestClient old) throws Exception {
-        if (current.client != old) {
-            return current;
-        }
-        current.client = null;
-        current.channel = null;
-        closeClient(old, false);
-        return open(factory);
+    /** Close the dead client, then put a new client/channel into this same Session. */
+    static void reopen(ClientFactory factory, Session session) throws Exception {
+        SnowflakeStreamingIngestClient dying = session.client;
+        session.client = null;
+        session.channel = null;
+        closeClient(dying, false);
+        Session fresh = open(factory);
+        session.client = fresh.client;
+        session.channel = fresh.channel;
     }
 
     static void closeClient(SnowflakeStreamingIngestClient client, boolean flush)
@@ -155,6 +170,8 @@ final class ElasticStep3 {
         if (client == null) {
             return;
         }
+        // flush=true only after every accepted event is checkpointed. On failure
+        // the source checkpoint is the authority, so we do not wait for a flush.
         client.close(flush, Duration.ofSeconds(60)).get(60, TimeUnit.SECONDS);
     }
 
@@ -163,10 +180,12 @@ final class ElasticStep3 {
     }
 
     static boolean isBackpressure(SFException error) {
+        // SDK rejected this append. Retry the same event; do not replace the client.
         return error.getHttpStatusCode() == 429;
     }
 
     static boolean isRetryable(SFException error) {
+        // Transient SDK/HTTP failures. Anything else is terminal, including non-SFException.
         int status = error.getHttpStatusCode();
         return isInvalidation(error)
                 || status == 408
@@ -177,20 +196,25 @@ final class ElasticStep3 {
                 || status == 504;
     }
 
-    static long remaining(long deadline) throws TimeoutException {
-        long nanos = deadline - System.nanoTime();
-        if (nanos <= 0) {
+    static void failIfStalled(long deadline) throws TimeoutException {
+        if (System.nanoTime() >= deadline) {
+            // In-flight acks are left running. The last source checkpoint stays authoritative.
             throw new TimeoutException(
                     "No confirmed progress before the deadline; retain unconfirmed events");
         }
-        return nanos;
+    }
+
+    static long nanosLeft(long deadline) throws TimeoutException {
+        failIfStalled(deadline);
+        return deadline - System.nanoTime();
     }
 
     static void backoff(int attempt, long deadline) throws Exception {
+        // Randomized exponential backoff, capped at 10s, never past the stall deadline.
         long capMillis = Math.min(10_000, 250L << Math.min(attempt, 6));
         long delay = TimeUnit.MILLISECONDS.toNanos(
                 ThreadLocalRandom.current().nextLong(capMillis + 1));
-        TimeUnit.NANOSECONDS.sleep(Math.min(delay, remaining(deadline)));
+        TimeUnit.NANOSECONDS.sleep(Math.min(delay, nanosLeft(deadline)));
     }
 
     static SFException sdkError(Throwable error) {
@@ -204,9 +228,10 @@ final class ElasticStep3 {
 
     static SFException failure(CompletableFuture<Void> ack) {
         try {
-            ack.getNow(null);
+            ack.getNow(null); // completed Future only; never waits
             return null;
         } catch (CompletionException error) {
+            // Future.get wraps the cause. Only SFException is an SDK error we classify.
             SFException sdk = sdkError(error);
             if (sdk != null) {
                 return sdk;

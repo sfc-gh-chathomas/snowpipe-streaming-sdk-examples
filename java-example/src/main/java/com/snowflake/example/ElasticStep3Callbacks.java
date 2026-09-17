@@ -2,7 +2,6 @@ package com.snowflake.example;
 
 import com.snowflake.ingest.streaming.ErrorDetail;
 import com.snowflake.ingest.streaming.SFException;
-import com.snowflake.ingest.streaming.SnowflakeStreamingIngestClient;
 import com.snowflake.ingest.streaming.SuccessDetail;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -18,25 +17,25 @@ import java.util.concurrent.TimeUnit;
 public class ElasticStep3Callbacks {
     static final class Pending {
         final ElasticStep3.Event event;
-        final SnowflakeStreamingIngestClient submittedBy;
-        volatile boolean ok;
+        volatile boolean ok; // written on the SDK ack thread
         volatile SFException error;
 
-        Pending(ElasticStep3.Event event, SnowflakeStreamingIngestClient submittedBy) {
+        Pending(ElasticStep3.Event event) {
             this.event = event;
-            this.submittedBy = submittedBy;
         }
 
         boolean succeeded() {
-            return ok && error == null;
+            // Once acked, stay acked. A late error on this object cannot un-checkpoint it.
+            return ok;
         }
 
         SFException error() {
-            return error;
+            return ok ? null : error;
         }
     }
 
     static void installHandlers(ElasticStep3.Session session) {
+        // Must be set before the first append; reopen() needs this again on the new channel.
         session.channel.setSuccessHandler(ElasticStep3Callbacks::onSuccess);
         session.channel.setErrorHandler(ElasticStep3Callbacks::onError);
     }
@@ -50,59 +49,36 @@ public class ElasticStep3Callbacks {
 
     static void onError(ErrorDetail detail) {
         for (Object token : detail.getAppendTokens()) {
+            // May stamp a Pending we already dropped after resubmit. The loop never reads those.
             ((Pending) token).error = detail.getError();
         }
     }
 
-    static ElasticStep3.Session open(ElasticStep3.ClientFactory factory) throws Exception {
-        ElasticStep3.Session session = ElasticStep3.open(factory);
-        try {
-            installHandlers(session);
-            return session;
-        } catch (Exception error) {
-            try {
-                ElasticStep3.closeClient(session.client, false);
-            } catch (Exception closeError) {
-                error.addSuppressed(closeError);
-            }
-            throw error;
-        }
-    }
-
-    static ElasticStep3.Session replace(
+    static void recover(
             ElasticStep3.ClientFactory factory,
-            ElasticStep3.Session current,
-            SnowflakeStreamingIngestClient old) throws Exception {
-        ElasticStep3.Session session = ElasticStep3.replace(factory, current, old);
-        if (session == current) {
-            return session;
-        }
-        try {
-            installHandlers(session);
-            return session;
-        } catch (Exception error) {
-            try {
-                ElasticStep3.closeClient(session.client, false);
-            } catch (Exception closeError) {
-                error.addSuppressed(closeError);
-            }
-            throw error;
-        }
+            ElasticStep3.Session session,
+            Deque<Pending> pending,
+            int failures,
+            long deadline) throws Exception {
+        ElasticStep3.reopen(factory, session);
+        installHandlers(session);
+        resubmit(session, pending);
+        ElasticStep3.backoff(failures, deadline);
     }
 
     static Pending submit(ElasticStep3.Session session, ElasticStep3.Event event) {
-        Pending pending = new Pending(event, session.client);
+        Pending pending = new Pending(event);
+        // Token is this attempt. A resubmit allocates a new Pending so late acks miss the deque.
+        // If rows are large, use a tiny id instead: the SDK retains the token until ack.
         session.channel.appendRow(event.row, pending);
         return pending;
     }
 
-    static void resubmit(
-            ElasticStep3.Session session,
-            Deque<Pending> pending,
-            SnowflakeStreamingIngestClient old) {
+    static void resubmit(ElasticStep3.Session session, Deque<Pending> pending) {
         Deque<Pending> next = new ArrayDeque<>();
         for (Pending item : pending) {
-            if (item.succeeded() || item.submittedBy != old) {
+            // Durability already confirmed for this row; replay would only duplicate it.
+            if (item.succeeded()) {
                 next.addLast(item);
             } else {
                 next.addLast(submit(session, item.event));
@@ -112,13 +88,11 @@ public class ElasticStep3Callbacks {
         pending.addAll(next);
     }
 
-    static SFException invalidationOfCurrent(
-            Deque<Pending> pending, SnowflakeStreamingIngestClient current) {
+    static SFException findInvalidation(Deque<Pending> pending) {
         for (Pending item : pending) {
             SFException error = item.error();
-            if (error != null
-                    && ElasticStep3.isInvalidation(error)
-                    && item.submittedBy == current) {
+            // The live handle is dead even if this error is not at the checkpoint head.
+            if (error != null && ElasticStep3.isInvalidation(error)) {
                 return error;
             }
         }
@@ -128,6 +102,7 @@ public class ElasticStep3Callbacks {
     static int collectPrefix(
             Deque<Pending> pending, ElasticStep3.SampleEventSource source) {
         int confirmed = 0;
+        // Stop at the first gap. A later success cannot skip an earlier unresolved event.
         while (!pending.isEmpty() && pending.peekFirst().succeeded()) {
             source.acknowledge(pending.removeFirst().event.position);
             confirmed++;
@@ -146,31 +121,30 @@ public class ElasticStep3Callbacks {
             ElasticStep3.SampleEventSource source,
             int maxPending,
             long stallNanos) throws Exception {
-        ElasticStep3.Session session = open(factory);
+        ElasticStep3.Session session = ElasticStep3.open(factory);
         Deque<Pending> pending = new ArrayDeque<>();
-        ElasticStep3.Event event = null;
-        boolean atFront = false;
+        ElasticStep3.Event event = null; // held until append returns; 429 retries this same row
+        boolean atFront = false; // retry must stay ahead of later pending acks
         boolean exhausted = false;
         int failures = 0;
         long deadline = System.nanoTime() + stallNanos;
         boolean completed = false;
         try {
+            installHandlers(session);
             while (true) {
-                // Never wait on an unfinished ack during intake.
+                // Collect finished acks without waiting. Waiting happens only if intake is paused.
                 if (collectPrefix(pending, source) > 0) {
+                    // Stall timer follows checkpoint progress, not successful submits.
                     deadline = System.nanoTime() + stallNanos;
                     failures = 0;
                 }
 
-                SFException invalidation = invalidationOfCurrent(pending, session.client);
+                SFException invalidation = findInvalidation(pending);
                 if (invalidation != null) {
                     if (++failures >= ElasticStep3.MAX_ATTEMPTS) {
                         throw invalidation;
                     }
-                    SnowflakeStreamingIngestClient old = session.client;
-                    session = replace(factory, session, old);
-                    resubmit(session, pending, old);
-                    ElasticStep3.backoff(failures, deadline);
+                    recover(factory, session, pending, failures, deadline);
                     continue;
                 }
 
@@ -182,7 +156,7 @@ public class ElasticStep3Callbacks {
                         throw headError;
                     }
                     ElasticStep3.backoff(failures, deadline);
-                    // Re-submit this event in front of later accepted work.
+                    // Re-enter the submit path so 429/invalidation handling stays in one place.
                     event = head.event;
                     pending.removeFirst();
                     atFront = true;
@@ -190,6 +164,7 @@ public class ElasticStep3Callbacks {
                 }
 
                 if (pending.isEmpty() && event == null) {
+                    // Caught up: no outstanding or held event, so the stall timer does not apply.
                     deadline = System.nanoTime() + stallNanos;
                     if (exhausted) {
                         completed = true;
@@ -197,10 +172,12 @@ public class ElasticStep3Callbacks {
                     }
                 }
 
-                ElasticStep3.remaining(deadline);
+                ElasticStep3.failIfStalled(deadline);
+                // Pause at the pending cap, or after EOF while acks are still in flight.
+                // event != null means we still hold a row to retry, so keep going.
                 if (pending.size() >= maxPending || (exhausted && event == null)) {
                     TimeUnit.NANOSECONDS.sleep(
-                            Math.min(ElasticStep3.POLL_NANOS, ElasticStep3.remaining(deadline)));
+                            Math.min(ElasticStep3.POLL_NANOS, ElasticStep3.nanosLeft(deadline)));
                     continue;
                 }
 
@@ -226,17 +203,15 @@ public class ElasticStep3Callbacks {
                         throw error;
                     }
                     if (ElasticStep3.isBackpressure(error)) {
-                        ElasticStep3.backoff(1, deadline);
+                        // Keep this event and every earlier pending ack. Do not open a new client.
+                        ElasticStep3.backoff(1, deadline); // first delay step; 429 is not a failed attempt
                         continue;
                     }
                     if (ElasticStep3.isInvalidation(error)) {
                         if (++failures >= ElasticStep3.MAX_ATTEMPTS) {
                             throw error;
                         }
-                        SnowflakeStreamingIngestClient old = session.client;
-                        session = replace(factory, session, old);
-                        resubmit(session, pending, old);
-                        ElasticStep3.backoff(failures, deadline);
+                        recover(factory, session, pending, failures, deadline);
                         continue;
                     }
                     if (++failures >= ElasticStep3.MAX_ATTEMPTS) {
@@ -246,6 +221,7 @@ public class ElasticStep3Callbacks {
                 }
             }
         } finally {
+            // Flush only when every accepted event was checkpointed.
             ElasticStep3.closeClient(session.client, completed);
         }
     }

@@ -1,8 +1,8 @@
 package com.snowflake.example;
 
 /**
- * Default Elastic step 3 entry point. Uses the Futures acknowledgement API.
- * See {@link ElasticStep3Callbacks} for the handler-based variant.
+ * README entry point for step 3. Delegates to {@link ElasticStep3Futures};
+ * {@link ElasticStep3Callbacks} is the handler-based variant of the same loop.
  */
 public class ElasticStep3Production {
     public static void main(String[] args) throws Exception {
