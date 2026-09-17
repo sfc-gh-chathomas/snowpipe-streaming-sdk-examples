@@ -10,7 +10,8 @@ checkpointing. These examples require `snowpipe-streaming` **1.8.0 or later**.
 | --- | --- | --- |
 | Elastic 1 | `ElasticStep1Quickstart` | Create a table client, append one row, wait for durability, and close. |
 | Elastic 2 | `ElasticStep2Continuous` | Bound pending acknowledgement Futures and drain them at shutdown. |
-| Elastic 3 | `ElasticStep3Production` | Retain source events, checkpoint confirmed progress, retry, and swap an invalid client. |
+| Elastic 3 (Futures) | `ElasticStep3Futures` (`ElasticStep3Production`) | Retain source events, checkpoint confirmed progress, retry, and swap an invalid client. |
+| Elastic 3 (Callbacks) | `ElasticStep3Callbacks` | Same recovery loop using `appendRow` plus success/error handlers. |
 | Named | `NamedChannelCheckpoint` | Position a retained source from a stable channel's committed offset token. |
 
 `StreamingIngestExample` is retained for compatibility. New integrations
@@ -72,6 +73,8 @@ mvn clean package
 mvn exec:java
 mvn exec:java -Dexec.mainClass=com.snowflake.example.ElasticStep2Continuous
 mvn exec:java -Dexec.mainClass=com.snowflake.example.ElasticStep3Production
+mvn exec:java -Dexec.mainClass=com.snowflake.example.ElasticStep3Futures
+mvn exec:java -Dexec.mainClass=com.snowflake.example.ElasticStep3Callbacks
 mvn exec:java -Dexec.mainClass=com.snowflake.example.NamedChannelCheckpoint
 ```
 
@@ -91,9 +94,11 @@ completes. The example propagates errors that remain after SDK retries.
 
 Step 3 models a retained source with `SampleEventSource`. Its data is
 regenerable and its checkpoint exists only in memory. A real producer must
-replace its read, acknowledge, and seek operations with retained source APIs.
+replace its read and acknowledge operations with retained source APIs.
 Replaying an Elastic append can create a duplicate, so production event IDs
-must remain stable.
+must remain stable. `ElasticStep3Futures` waits on acknowledgement Futures;
+`ElasticStep3Callbacks` uses `appendRow` plus success/error handlers. The
+handlers only record outcomes — they do not checkpoint or replace the client.
 
 Give each named channel one writer. Offset tokens are checkpoint metadata, not
 deduplication keys. Row errors must be reconciled before advancing the source
