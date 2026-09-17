@@ -105,8 +105,8 @@ class NamedChannelCheckpointTest {
     @Test
     void restartSeeksAfterServerOffset() throws Exception {
         Fake fake = new Fake(2);
-        ElasticStep3Production.SampleEventSource source =
-                new ElasticStep3Production.SampleEventSource(5, 0);
+        NamedChannelCheckpoint.SampleEventSource source =
+                new NamedChannelCheckpoint.SampleEventSource(5, 0);
 
         NamedChannelCheckpoint.run(producer(fake), source);
 
@@ -119,8 +119,8 @@ class NamedChannelCheckpointTest {
     void invalidationReplaysOnlyBeyondCommittedOffset() throws Exception {
         Fake fake = new Fake(0);
         fake.invalidateThird = true;
-        ElasticStep3Production.SampleEventSource source =
-                new ElasticStep3Production.SampleEventSource(4, 0);
+        NamedChannelCheckpoint.SampleEventSource source =
+                new NamedChannelCheckpoint.SampleEventSource(4, 0);
 
         NamedChannelCheckpoint.run(producer(fake), source);
 
@@ -133,8 +133,8 @@ class NamedChannelCheckpointTest {
     void backpressureRetriesCurrentEventWithoutReopen() throws Exception {
         Fake fake = new Fake(0);
         fake.backpressure = 1;
-        ElasticStep3Production.SampleEventSource source =
-                new ElasticStep3Production.SampleEventSource(1, 0);
+        NamedChannelCheckpoint.SampleEventSource source =
+                new NamedChannelCheckpoint.SampleEventSource(1, 0);
 
         NamedChannelCheckpoint.run(producer(fake), source);
 
@@ -147,8 +147,8 @@ class NamedChannelCheckpointTest {
     void rowErrorsPreventSourceHandoff() {
         Fake fake = new Fake(0);
         fake.errors = 1;
-        ElasticStep3Production.SampleEventSource source =
-                new ElasticStep3Production.SampleEventSource(2, 0);
+        NamedChannelCheckpoint.SampleEventSource source =
+                new NamedChannelCheckpoint.SampleEventSource(2, 0);
 
         assertThrows(
                 IllegalStateException.class,

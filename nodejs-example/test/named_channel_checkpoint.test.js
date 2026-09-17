@@ -3,7 +3,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const streaming = require("snowpipe-streaming");
-const support = require("../elastic_step3_production.js");
 const named = require("../named_channel_checkpoint.js");
 
 const error = (code, status) =>
@@ -40,7 +39,7 @@ function fakeProducer(committed = 0) {
 
 test("restart seeks after the server offset", async () => {
   const producer = fakeProducer(2);
-  const source = new support.SampleEventSource(5);
+  const source = new named.SampleEventSource(5);
 
   await named.run(producer, source);
 
@@ -55,7 +54,7 @@ test("backpressure retries the current event without reopening", async (context)
     producer.onAppend = null;
     throw error("ReceiverSaturated", 429);
   };
-  const source = new support.SampleEventSource(2);
+  const source = new named.SampleEventSource(2);
 
   await named.run(producer, source);
 
@@ -72,7 +71,7 @@ test("invalidation resumes from committed progress", async (context) => {
       throw error("InvalidChannelError", 409);
     }
   };
-  const source = new support.SampleEventSource(4);
+  const source = new named.SampleEventSource(4);
 
   await named.run(producer, source);
 
@@ -88,7 +87,7 @@ test("row errors prevent source handoff", async () => {
     rowsErrorCount: 1,
     latestCommittedOffsetToken: "2",
   });
-  const source = new support.SampleEventSource(2);
+  const source = new named.SampleEventSource(2);
 
   await assert.rejects(named.run(producer, source), /row errors/i);
 

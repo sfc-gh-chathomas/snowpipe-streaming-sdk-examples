@@ -1,22 +1,20 @@
 package com.snowflake.example;
 
-import static com.snowflake.example.ElasticStep3Production.MAX_ATTEMPTS;
-import static com.snowflake.example.ElasticStep3Production.MAX_NO_PROGRESS_NANOS;
-import static com.snowflake.example.ElasticStep3Production.MAX_PENDING_EVENTS;
-import static com.snowflake.example.ElasticStep3Production.POLL_NANOS;
-import static com.snowflake.example.ElasticStep3Production.backoff;
-import static com.snowflake.example.ElasticStep3Production.isInvalidation;
-import static com.snowflake.example.ElasticStep3Production.isRetryable;
-import static com.snowflake.example.ElasticStep3Production.remaining;
-
-import com.snowflake.example.ElasticStep3Production.ClientFactory;
-import com.snowflake.example.ElasticStep3Production.SampleEventSource;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.snowflake.ingest.streaming.ChannelStatus;
 import com.snowflake.ingest.streaming.OpenChannelResult;
 import com.snowflake.ingest.streaming.SFException;
 import com.snowflake.ingest.streaming.SnowflakeStreamingIngestClient;
+import com.snowflake.ingest.streaming.SnowflakeStreamingIngestClientFactory;
 import com.snowflake.ingest.streaming.SnowflakeStreamingIngestChannel;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -27,10 +25,118 @@ import java.util.concurrent.TimeUnit;
  * is confirmed.
  */
 public class NamedChannelCheckpoint {
-    static final String CHANNEL_NAME = ElasticStep3Production.env(
-            "SNOWFLAKE_CHANNEL", "production-source-0");
+    static final int MAX_PENDING_EVENTS = 100_000;
+    static final long MAX_NO_PROGRESS_NANOS = TimeUnit.MINUTES.toNanos(30);
+    static final long POLL_NANOS = TimeUnit.SECONDS.toNanos(1);
+    static final int MAX_ATTEMPTS = 6;
+    static final List<String> INVALIDATION_ERRORS = List.of(
+            "InvalidChannelError",
+            "InvalidClientError",
+            "ClosedChannelError",
+            "ClosedElasticChannelError",
+            "ClosedClientError");
+    static final String CHANNEL_NAME = env("SNOWFLAKE_CHANNEL", "production-source-0");
     static final int CHECKPOINT_ROWS = 1_000;
     static final long CHECKPOINT_NANOS = TimeUnit.SECONDS.toNanos(5);
+
+    static SnowflakeStreamingIngestClient createClient() throws Exception {
+        Properties properties = new Properties();
+        JsonNode profile = new ObjectMapper().readTree(Files.readAllBytes(
+                Paths.get(env("SNOWFLAKE_PROFILE", "profile.json"))));
+        profile.fields().forEachRemaining(
+                entry -> properties.put(entry.getKey(), entry.getValue().asText()));
+        return SnowflakeStreamingIngestClientFactory.tableBuilder(
+                "production-" + ProcessHandle.current().pid(),
+                env("SNOWFLAKE_DATABASE", "MY_DATABASE"),
+                env("SNOWFLAKE_SCHEMA", "MY_SCHEMA"),
+                env("SNOWFLAKE_TABLE", "MY_TABLE"))
+                .setProperties(properties)
+                .build();
+    }
+
+    static String env(String name, String fallback) {
+        String value = System.getenv(name);
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    static class Event {
+        final long offset;
+        final Map<String, Object> row;
+
+        Event(long offset) {
+            this.offset = offset;
+            this.row = Map.of(
+                    "EVENT_ID", offset,
+                    "C1", offset,
+                    "C2", "event-" + offset);
+        }
+    }
+
+    static class SampleEventSource {
+        final long total;
+        long committed;
+        long nextOffset;
+
+        SampleEventSource(long total, long checkpoint) {
+            if (checkpoint < 0 || checkpoint > total) {
+                throw new IllegalArgumentException("Require 0 <= checkpoint <= total");
+            }
+            this.total = total;
+            this.committed = checkpoint;
+            this.nextOffset = checkpoint + 1;
+        }
+
+        Event read() {
+            return nextOffset > total ? null : new Event(nextOffset++);
+        }
+
+        void acknowledge(long offset) {
+            if (offset < committed || offset > total) {
+                throw new IllegalArgumentException("Invalid source checkpoint");
+            }
+            committed = offset;
+        }
+
+        void seek(long offset) {
+            acknowledge(offset);
+            nextOffset = offset + 1;
+        }
+    }
+
+    interface ClientFactory {
+        SnowflakeStreamingIngestClient create() throws Exception;
+    }
+
+    static boolean isInvalidation(SFException error) {
+        return INVALIDATION_ERRORS.contains(error.getErrorCodeName());
+    }
+
+    static boolean isRetryable(SFException error) {
+        int status = error.getHttpStatusCode();
+        return isInvalidation(error)
+                || status == 408
+                || status == 429
+                || status == 500
+                || status == 502
+                || status == 503
+                || status == 504;
+    }
+
+    static long remaining(long deadline) throws java.util.concurrent.TimeoutException {
+        long nanos = deadline - System.nanoTime();
+        if (nanos <= 0) {
+            throw new java.util.concurrent.TimeoutException(
+                    "No confirmed progress before the deadline; retain unconfirmed events");
+        }
+        return nanos;
+    }
+
+    static void backoff(int attempt, long deadline) throws Exception {
+        long capMillis = Math.min(10_000, 250L << Math.min(attempt, 6));
+        long delay = TimeUnit.MILLISECONDS.toNanos(
+                ThreadLocalRandom.current().nextLong(capMillis + 1));
+        TimeUnit.NANOSECONDS.sleep(Math.min(delay, remaining(deadline)));
+    }
 
     static long parseOffset(String token) {
         return token == null ? 0 : Long.parseLong(token);
@@ -121,7 +227,7 @@ public class NamedChannelCheckpoint {
         // Snowflake's committed token determines where this retained source resumes.
         source.seek(producer.open());
         long submitted = source.committed;
-        ElasticStep3Production.Event event = null;
+        Event event = null;
         boolean exhausted = false;
         int failures = 0;
         int rowsSincePoll = 0;
@@ -201,11 +307,9 @@ public class NamedChannelCheckpoint {
 
     public static void main(String[] args) throws Exception {
         SampleEventSource source = new SampleEventSource(
-                Long.parseLong(ElasticStep3Production.env(
-                        "SNOWFLAKE_TEST_ROWS", "10000")),
+                Long.parseLong(env("SNOWFLAKE_TEST_ROWS", "10000")),
                 0);
-        NamedProducer producer = new NamedProducer(
-                ElasticStep3Production::createClient);
+        NamedProducer producer = new NamedProducer(NamedChannelCheckpoint::createClient);
         boolean completed = false;
         try {
             run(producer, source);

@@ -10,23 +10,100 @@ committed progress is confirmed.
 """
 
 import os
+import random
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 from snowflake.ingest import streaming
 
-from elastic_step3_production import (
-    MAX_ATTEMPTS,
-    MAX_NO_PROGRESS_SECONDS,
-    MAX_PENDING_EVENTS,
-    POLL_SECONDS,
-    SampleEventSource,
-    backoff,
-    create_client,
-    is_invalidation,
-    remaining,
-    is_retryable,
-)
+from elastic_step1_quickstart import connection_properties
+
+
+MAX_ATTEMPTS = 6
+MAX_NO_PROGRESS_SECONDS = 30 * 60.0
+MAX_PENDING_EVENTS = 100_000
+POLL_SECONDS = 1.0
+INVALIDATION_ERRORS = {
+    "InvalidChannelError",
+    "InvalidClientError",
+    "ClosedChannelError",
+    "ClosedElasticChannelError",
+    "ClosedClientError",
+}
+TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+
+def create_client() -> streaming.StreamingIngestClient:
+    properties = connection_properties()
+    return streaming.StreamingIngestClient.from_table(
+        client_name=f"recovery-{os.getpid()}",
+        db_name=os.environ.get("SNOWFLAKE_DATABASE", "MY_DATABASE"),
+        schema_name=os.environ.get("SNOWFLAKE_SCHEMA", "MY_SCHEMA"),
+        table_name=os.environ.get("SNOWFLAKE_TABLE", "MY_TABLE"),
+        profile_json=None if properties else os.environ.get("SNOWFLAKE_PROFILE", "profile.json"),
+        properties=properties,
+    )
+
+
+@dataclass(frozen=True)
+class Event:
+    offset: int
+    row: dict[str, object]
+
+
+class SampleEventSource:
+    """Regenerable sample data with an in-memory, non-durable checkpoint."""
+
+    def __init__(self, total: int = 10_000, checkpoint: int = 0) -> None:
+        if not 0 <= checkpoint <= total:
+            raise ValueError("Require 0 <= checkpoint <= total")
+        self.total = total
+        self.committed = checkpoint
+        self.next_offset = checkpoint + 1
+
+    def read(self) -> Optional[Event]:
+        if self.next_offset > self.total:
+            return None
+        offset = self.next_offset
+        self.next_offset += 1
+        return Event(
+            offset,
+            {"EVENT_ID": offset, "C1": offset, "C2": f"event-{offset}"},
+        )
+
+    def acknowledge(self, offset: int) -> None:
+        if not self.committed <= offset <= self.total:
+            raise ValueError("Invalid source checkpoint")
+        self.committed = offset
+
+    def seek(self, committed: int) -> None:
+        self.acknowledge(committed)
+        self.next_offset = committed + 1
+
+
+def is_invalidation(error: streaming.StreamingIngestError) -> bool:
+    return error.error_code.value in INVALIDATION_ERRORS
+
+
+def is_retryable(error: BaseException) -> bool:
+    return isinstance(error, streaming.StreamingIngestError) and (
+        is_invalidation(error) or error.http_status_code in TRANSIENT_STATUS_CODES
+    )
+
+
+def remaining(deadline: float) -> float:
+    seconds = deadline - time.monotonic()
+    if seconds <= 0:
+        raise TimeoutError(
+            "No confirmed progress before the deadline; retain unconfirmed source events"
+        )
+    return seconds
+
+
+def backoff(attempt: int, deadline: float) -> None:
+    cap = min(10.0, 0.25 * 2 ** min(attempt, 6))
+    time.sleep(min(random.uniform(0, cap), remaining(deadline)))
 
 
 CHANNEL_NAME = os.environ.get("SNOWFLAKE_CHANNEL", "production-source-0")

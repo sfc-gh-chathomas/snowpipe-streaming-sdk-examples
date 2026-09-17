@@ -7,7 +7,84 @@
 "use strict";
 
 const streaming = require("snowpipe-streaming");
-const support = require("./elastic_step3_production.js");
+
+const MAX_PENDING_EVENTS = 100_000;
+const MAX_NO_PROGRESS_MS = 30 * 60_000;
+const POLL_MS = 1_000;
+const MAX_ATTEMPTS = 6;
+const INVALIDATION_ERRORS = new Set([
+  "InvalidChannelError",
+  "InvalidClientError",
+  "ClosedChannelError",
+  "ClosedElasticChannelError",
+  "ClosedClientError",
+]);
+
+async function createClient() {
+  return streaming.createTableClient({
+    clientName: `production-${process.pid}`,
+    dbName: process.env.SNOWFLAKE_DATABASE || "MY_DATABASE",
+    schemaName: process.env.SNOWFLAKE_SCHEMA || "MY_SCHEMA",
+    tableName: process.env.SNOWFLAKE_TABLE || "MY_TABLE",
+    profilePath: process.env.SNOWFLAKE_PROFILE || "profile.json",
+  });
+}
+
+class SampleEventSource {
+  constructor(total = 10_000, checkpoint = 0) {
+    if (!Number.isSafeInteger(total) || checkpoint < 0 || checkpoint > total) {
+      throw new Error("Require integer 0 <= checkpoint <= total");
+    }
+    this.total = total;
+    this.committed = checkpoint;
+    this.nextOffset = checkpoint + 1;
+  }
+
+  read() {
+    if (this.nextOffset > this.total) return null;
+    const offset = this.nextOffset++;
+    return {
+      offset,
+      row: { EVENT_ID: offset, C1: offset, C2: `event-${offset}` },
+    };
+  }
+
+  acknowledge(offset) {
+    if (offset < this.committed || offset > this.total) {
+      throw new Error("Invalid source checkpoint");
+    }
+    this.committed = offset;
+  }
+
+  seek(committed) {
+    this.acknowledge(committed);
+    this.nextOffset = committed + 1;
+  }
+}
+
+function isInvalidation(error) {
+  return INVALIDATION_ERRORS.has(error.errorCode);
+}
+
+function isRetryable(error) {
+  return error instanceof streaming.StreamingIngestError
+    && (isInvalidation(error)
+      || [408, 429, 500, 502, 503, 504].includes(error.httpStatusCode));
+}
+
+function remaining(deadline) {
+  const millis = deadline - performance.now();
+  if (millis <= 0) {
+    throw new Error("No confirmed progress before deadline; retain unconfirmed events");
+  }
+  return millis;
+}
+
+async function backoff(attempt, deadline) {
+  const cap = Math.min(10_000, 250 * 2 ** Math.min(attempt, 6));
+  const delay = Math.min(remaining(deadline), Math.random() * cap);
+  await new Promise((resolve) => setTimeout(resolve, delay));
+}
 
 const CHANNEL_NAME = process.env.SNOWFLAKE_CHANNEL || "production-source-0";
 const CHECKPOINT_ROWS = 1_000;
@@ -23,7 +100,7 @@ function parseOffset(token) {
 }
 
 class NamedProducer {
-  constructor(factory = support.createClient) {
+  constructor(factory = createClient) {
     this.factory = factory;
     this.client = null;
     this.channel = null;
@@ -99,7 +176,7 @@ async function run(producer, source) {
   let failures = 0;
   let rowsSincePoll = 0;
   let nextPoll = performance.now() + CHECKPOINT_MS;
-  let deadline = performance.now() + support.MAX_NO_PROGRESS_MS;
+  let deadline = performance.now() + MAX_NO_PROGRESS_MS;
 
   while (true) {
     try {
@@ -109,12 +186,12 @@ async function run(producer, source) {
           || event
           || rowsSincePoll >= CHECKPOINT_ROWS
           || performance.now() >= nextPoll
-          || submitted - source.committed >= support.MAX_PENDING_EVENTS);
+          || submitted - source.committed >= MAX_PENDING_EVENTS);
       if (shouldPoll) {
         const previous = source.committed;
         await collectProgress(producer, submitted, source);
         if (source.committed > previous) {
-          deadline = performance.now() + support.MAX_NO_PROGRESS_MS;
+          deadline = performance.now() + MAX_NO_PROGRESS_MS;
           failures = 0;
         }
         rowsSincePoll = 0;
@@ -122,15 +199,15 @@ async function run(producer, source) {
       }
 
       if (submitted === source.committed && !event) {
-        deadline = performance.now() + support.MAX_NO_PROGRESS_MS;
+        deadline = performance.now() + MAX_NO_PROGRESS_MS;
         if (exhausted) return;
       }
 
-      support.remaining(deadline);
+      remaining(deadline);
       if (exhausted
-        || submitted - source.committed >= support.MAX_PENDING_EVENTS) {
+        || submitted - source.committed >= MAX_PENDING_EVENTS) {
         await new Promise((resolve) => {
-          setTimeout(resolve, Math.min(support.POLL_MS, support.remaining(deadline)));
+          setTimeout(resolve, Math.min(POLL_MS, remaining(deadline)));
         });
         continue;
       }
@@ -146,27 +223,27 @@ async function run(producer, source) {
       rowsSincePoll++;
       event = null;
     } catch (error) {
-      if (!support.isRetryable(error)) throw error;
-      if (error.httpStatusCode !== 429 && ++failures >= support.MAX_ATTEMPTS) {
+      if (!isRetryable(error)) throw error;
+      if (error.httpStatusCode !== 429 && ++failures >= MAX_ATTEMPTS) {
         throw error;
       }
-      if (support.isInvalidation(error)) {
+      if (isInvalidation(error)) {
         const previous = source.committed;
         source.seek(await producer.recover(error));
         if (source.committed > previous) {
-          deadline = performance.now() + support.MAX_NO_PROGRESS_MS;
+          deadline = performance.now() + MAX_NO_PROGRESS_MS;
         }
         submitted = source.committed;
         event = null;
         exhausted = false;
       }
-      await support.backoff(2, deadline);
+      await backoff(2, deadline);
     }
   }
 }
 
 async function main() {
-  const source = new support.SampleEventSource(
+  const source = new SampleEventSource(
     Number(process.env.SNOWFLAKE_TEST_ROWS || 10_000),
   );
   const producer = new NamedProducer();
@@ -194,9 +271,19 @@ if (require.main === module) {
 }
 
 module.exports = {
+  MAX_ATTEMPTS,
+  MAX_NO_PROGRESS_MS,
+  MAX_PENDING_EVENTS,
+  POLL_MS,
+  SampleEventSource,
   NamedProducer,
+  backoff,
   collectProgress,
+  createClient,
+  isInvalidation,
+  isRetryable,
   main,
   parseOffset,
+  remaining,
   run,
 };
