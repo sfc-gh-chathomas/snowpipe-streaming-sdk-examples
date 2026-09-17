@@ -2,6 +2,7 @@ package com.snowflake.example;
 
 import com.snowflake.ingest.streaming.ErrorDetail;
 import com.snowflake.ingest.streaming.SFException;
+import com.snowflake.ingest.streaming.SnowflakeStreamingIngestElasticChannel;
 import com.snowflake.ingest.streaming.SuccessDetail;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -34,10 +35,10 @@ public class ElasticStep3Callbacks {
         }
     }
 
-    static void installHandlers(ElasticStep3.Session session) {
+    static void installHandlers(SnowflakeStreamingIngestElasticChannel channel) {
         // Must be set before the first append; reopen() needs this again on the new channel.
-        session.channel.setSuccessHandler(ElasticStep3Callbacks::onSuccess);
-        session.channel.setErrorHandler(ElasticStep3Callbacks::onError);
+        channel.setSuccessHandler(ElasticStep3Callbacks::onSuccess);
+        channel.setErrorHandler(ElasticStep3Callbacks::onError);
     }
 
     static void onSuccess(SuccessDetail detail) {
@@ -54,34 +55,39 @@ public class ElasticStep3Callbacks {
         }
     }
 
-    static void recover(
+    /**
+     * The live handle can no longer ack. Close it without flush, put handlers on a
+     * new channel, replay rows that were not yet durable, then back off.
+     */
+    static void reopenAndResubmit(
             ElasticStep3.ClientFactory factory,
             ElasticStep3.Session session,
             Deque<Pending> pending,
             int failures,
             long deadline) throws Exception {
         ElasticStep3.reopen(factory, session);
-        installHandlers(session);
-        resubmit(session, pending);
+        installHandlers(session.channel);
+        resubmit(session.channel, pending);
         ElasticStep3.backoff(failures, deadline);
     }
 
-    static Pending submit(ElasticStep3.Session session, ElasticStep3.Event event) {
+    static Pending submit(SnowflakeStreamingIngestElasticChannel channel, ElasticStep3.Event event) {
         Pending pending = new Pending(event);
         // Token is this attempt. A resubmit allocates a new Pending so late acks miss the deque.
         // If rows are large, use a tiny id instead: the SDK retains the token until ack.
-        session.channel.appendRow(event.row, pending);
+        channel.appendRow(event.row, pending);
         return pending;
     }
 
-    static void resubmit(ElasticStep3.Session session, Deque<Pending> pending) {
+    static void resubmit(
+            SnowflakeStreamingIngestElasticChannel channel, Deque<Pending> pending) {
         Deque<Pending> next = new ArrayDeque<>();
         for (Pending item : pending) {
             // Durability already confirmed for this row; replay would only duplicate it.
             if (item.succeeded()) {
                 next.addLast(item);
             } else {
-                next.addLast(submit(session, item.event));
+                next.addLast(submit(channel, item.event));
             }
         }
         pending.clear();
@@ -130,7 +136,7 @@ public class ElasticStep3Callbacks {
         long deadline = System.nanoTime() + stallNanos;
         boolean completed = false;
         try {
-            installHandlers(session);
+            installHandlers(session.channel);
             while (true) {
                 // Collect finished acks without waiting. Waiting happens only if intake is paused.
                 if (collectPrefix(pending, source) > 0) {
@@ -144,7 +150,7 @@ public class ElasticStep3Callbacks {
                     if (++failures >= ElasticStep3.MAX_ATTEMPTS) {
                         throw invalidation;
                     }
-                    recover(factory, session, pending, failures, deadline);
+                    reopenAndResubmit(factory, session, pending, failures, deadline);
                     continue;
                 }
 
@@ -190,7 +196,7 @@ public class ElasticStep3Callbacks {
                 }
 
                 try {
-                    Pending submitted = submit(session, event);
+                    Pending submitted = submit(session.channel, event);
                     if (atFront) {
                         pending.addFirst(submitted);
                     } else {
@@ -211,7 +217,7 @@ public class ElasticStep3Callbacks {
                         if (++failures >= ElasticStep3.MAX_ATTEMPTS) {
                             throw error;
                         }
-                        recover(factory, session, pending, failures, deadline);
+                        reopenAndResubmit(factory, session, pending, failures, deadline);
                         continue;
                     }
                     if (++failures >= ElasticStep3.MAX_ATTEMPTS) {
