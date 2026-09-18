@@ -3,9 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "description": "Snowpipe Streaming SDK example for Node.js",
-  "main": "streaming_ingest_example.js",
+  "main": "elastic_step1_quickstart.js",
   "scripts": {
-    "start": "node streaming_ingest_example.js",
+    "start": "node elastic_step1_quickstart.js",
     "test": "node --test test/*.test.js"
   },
   "engines": {

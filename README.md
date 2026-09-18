@@ -11,14 +11,14 @@ The Snowpipe Streaming SDK enables applications to stream data directly into Sno
 Snowpipe Streaming supports two channel modes:
 
 - **Elastic Channels** (recommended default) — one implicit, Snowflake-managed channel per pipe. Simplest to develop against, with concurrent producers and durable acknowledgements. Use Elastic Channels unless you specifically need the guarantees below.
-- **Named channels** — caller-defined channels with offset tokens, for strict exactly-once ingestion, ordering, and source-offset recovery.
+- **Named channels** — caller-defined channels with offset tokens, for stable channel ownership, ordered ingestion, and source-offset recovery.
 
 Each language example below includes both an Elastic Channels path and a named-channel path.
 
 ## Production retention contract
 
-Each production example is self-contained: SDK calls, configuration, retry decisions, and the replay
-fixture live in the same file. Both modes append immediately and leave transport batching to the SDK.
+The production examples keep SDK calls, retry decisions, and source ownership visible. Both modes
+append immediately and leave transport batching to the SDK.
 They keep appending while the SDK accepts work and collect confirmed progress without draining
 every checkpoint. SDK backpressure pauses source intake; a separate 100,000-pending-event safety
 limit bounds application bookkeeping and may pause intake before the SDK buffer fills. This is not
@@ -40,9 +40,10 @@ persistent or replicated storage, and any finite buffer needs a capacity/overflo
 - Elastic: acknowledge source progress only after every append in the window is durably acknowledged.
   Recreate the client only for SDK invalidation. Terminal retryable SDK failures may be replayed with
   stable source-unique event IDs; even successful SDK internal retries can produce duplicates.
-- Named: assign one owner to each stable channel name. Reopen without supplying a replacement offset,
-  seek strictly after Snowflake's returned committed offset, and never drop the channel during recovery.
-  Schema/row errors require reconciliation rather than automatic source handoff.
+- Named: assign one owner to each stable channel name. Treat offset tokens as checkpoint metadata,
+  reopen without supplying a replacement offset, seek strictly after Snowflake's returned committed
+  offset, and never drop the channel during recovery. Schema/row errors require reconciliation rather
+  than automatic source handoff.
 - A successful Elastic acknowledgement is not proof of target-table visibility or row validity.
   Check the error table and materialization separately; shared Elastic status counters cannot validate
   one producer's checkpoint.
@@ -61,6 +62,7 @@ This repository contains complete, runnable examples in multiple languages:
 
 ### [Java Example](./java-example)
 A complete Maven project demonstrating the Snowpipe Streaming SDK in Java. Includes:
+- Three progressive Elastic examples plus a named-channel checkpointing alternative
 - Maven build configuration with all required dependencies
 - Full example code with proper error handling
 - Comprehensive setup instructions
@@ -69,6 +71,7 @@ A complete Maven project demonstrating the Snowpipe Streaming SDK in Java. Inclu
 
 ### [Python Example](./python-example)
 A complete Python project demonstrating the Snowpipe Streaming SDK in Python. Includes:
+- Three progressive Elastic examples plus a named-channel checkpointing alternative
 - Requirements file with all necessary packages
 - Clean, well-documented example code
 - Setup instructions with virtual environment
@@ -77,6 +80,7 @@ A complete Python project demonstrating the Snowpipe Streaming SDK in Python. In
 
 ### [Node.js Example](./nodejs-example)
 A complete Node.js project demonstrating the Snowpipe Streaming SDK in Node.js. Includes:
+- Three progressive Elastic examples plus a named-channel checkpointing alternative
 - npm package configuration with all required dependencies
 - Clean, well-documented example code
 - Setup instructions
