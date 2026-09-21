@@ -76,6 +76,9 @@ and drains accepted work.
   not shortened. If a requested delay exceeds the remaining 30-minute batch retry budget, the batch
   fails rather than retrying prematurely. Individual HTTP requests time out after 30 seconds.
 - Token discovery/exchange failures stop the batch; they are not silently retried indefinitely.
+- HTTP 404 is retried for transient availability loss, assuming the endpoint and target have been
+  validated during setup. Retries do not fix incorrect identifiers or missing resources. A persistent
+  404 fails after the bounded retry budget; verify the endpoint and target before restarting.
 - Shutdown requests stop intake, not an active HTTP request or its retries. The current batch and
   final partial batch finish under their retry budgets. This is not a hard process shutdown deadline.
   A failed drain must not be interpreted as successful delivery or permission to delete source events.

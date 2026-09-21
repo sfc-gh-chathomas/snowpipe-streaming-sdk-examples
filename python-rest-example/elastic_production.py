@@ -28,7 +28,7 @@ FLUSH_SECONDS = 1.0         # Checked between source reads, not by a background 
 REQUEST_TIMEOUT = 30
 RETRY_SECONDS = 30 * 60
 MAX_RETRIES = 8
-RETRYABLE = {408, 429, 500, 502, 503, 504}
+RETRYABLE = {404, 408, 429, 500, 502, 503, 504}
 
 
 def main():
@@ -160,6 +160,9 @@ def send_batch(session, tokens, target, body):
             if status not in RETRYABLE:
                 raise RuntimeError(f"Append failed HTTP {status}; requestId={request_id}")
         if attempt == MAX_RETRIES:
+            if response is not None and response.status_code == 404:
+                raise TimeoutError(f"Persistent HTTP 404; verify endpoint and target availability; "
+                                   f"retain source events; requestId={request_id}")
             raise TimeoutError(f"Append retries exhausted; requestId={request_id}")
         delay = retry_delay(response, attempt)
         if time.monotonic() + delay >= deadline:
