@@ -7,7 +7,7 @@ not named-channel offsets or continuation tokens.
 | Example | Purpose | What it handles |
 | --- | --- | --- |
 | `elastic_quickstart.sh` | First successful request using cURL and PAT | Host discovery, scoped-token exchange, two NDJSON rows, fail-fast HTTP handling |
-| `elastic_production.py` | Application integration using Python HTTP requests, no SDK | Key-pair JWT or PAT, scoped-token refresh, gzip batching, bounded dispatch, retries, and drain |
+| `elastic_production.py` | Application integration using Python HTTP requests, no SDK | Key-pair JWT or PAT, scoped-token refresh, sequential gzip batches, retries, and drain |
 
 ## Setup
 
@@ -50,7 +50,7 @@ For PAT authentication, inject `SNOWFLAKE_PAT` and set `SNOWFLAKE_ACCOUNT` and
 Both authentication paths discover the ingest hostname and exchange for a scoped token.
 Never commit profiles or keys. Private connectivity requires DNS for the discovered host.
 
-The actual entry point generates 1,505 rows by default. `SNOWFLAKE_TEST_ROWS` changes
+The actual entry point generates 10,505 rows by default. `SNOWFLAKE_TEST_ROWS` changes
 the count; `SNOWFLAKE_RUN_ID` sets the `C2` run marker. IDs are deterministic within
 the sample run. Replace them with source-unique stable IDs in a real application.
 Successful output reports confirmed and submitted counts. SIGINT/SIGTERM stops intake
@@ -58,22 +58,26 @@ and drains accepted work.
 
 ## Delivery and Bounds
 
-- REST clients own batching and compression. Defaults are 500 rows or 900,000 uncompressed bytes,
-  gzip compression, eight outstanding batches, and four workers. A single oversized row is rejected.
-- The published wire payload limit is 4 MB after compression. The application checks it explicitly;
-  the smaller uncompressed default is a conservative sample choice, not the service limit.
-- Partial batches flush after one second checked between submissions, or on explicit `flush`/close.
+- One thread sends one request at a time. Retries naturally pause source intake; no executors,
+  Futures, or background queues are required. The tradeoff is lower peak throughput than parallel requests.
+- The sample caps each exact gzip payload at **1,000,000 compressed bytes**, below the 4 MB
+  service wire limit. A candidate batch that exceeds the sample cap is split at row boundaries
+  and recompressed; no oversized request is sent. A single row that cannot fit is rejected.
+- Candidate batches have independent limits of 5,000 rows and 4,000,000 uncompressed bytes.
+  These bound input buffering, not total process memory: encoded rows and compression copies add overhead.
+  Highly compressible input need not reach the compressed cap before a memory/row bound triggers a flush.
+- Partial batches flush after one second checked between source reads, or at end-of-input/shutdown.
   An idle or blocking live source needs its own periodic flush integration.
-- Completed Futures are retired and failures surface during intake or drain. Bookkeeping does not
-  accumulate for the entire lifetime of the stream. Source payload storage remains an application concern.
+- Source progress advances only after each sequential request succeeds. If a split batch partly
+  succeeds, confirmed counts include those successful requests; unconfirmed source events remain yours.
 - Each batch keeps the same `requestId` across retries and increments `retryCount`, including the
   one permitted 401 refresh. This is correlation, not an exactly-once guarantee.
 - Retryable HTTP/network failures use bounded retries and jitter. Server `Retry-After` delays are
   not shortened. If a requested delay exceeds the remaining 30-minute batch retry budget, the batch
   fails rather than retrying prematurely. Individual HTTP requests time out after 30 seconds.
 - Token discovery/exchange failures stop the batch; they are not silently retried indefinitely.
-- `close(timeout)` bounds its acknowledgement wait, **not total process shutdown**. Admission may
-  wait for capacity and executor cleanup waits for running HTTP operations; neither is forcibly cancelled.
+- Shutdown requests stop intake, not an active HTTP request or its retries. The current batch and
+  final partial batch finish under their retry budgets. This is not a hard process shutdown deadline.
   A failed drain must not be interpreted as successful delivery or permission to delete source events.
 
 ## Source Responsibility
