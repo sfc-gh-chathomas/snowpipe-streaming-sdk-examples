@@ -33,6 +33,13 @@ A complete Node.js project demonstrating the Snowpipe Streaming SDK in Node.js. 
 - Setup instructions
 - Sample configuration files
 
+### [REST Examples](./python-rest-example)
+
+Use direct REST when the SDK is not suitable. Start with the cURL/PAT quickstart,
+then use the Python HTTP application example for JWT or PAT authentication,
+gzip batching, bounded concurrency, retry handling, and drain. Source retention
+and crash recovery remain application responsibilities.
+
 ## Getting Started
 
 1. Choose your preferred language (Java, Python, or Node.js)
