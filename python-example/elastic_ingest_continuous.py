@@ -1,4 +1,4 @@
-"""Level 3: callbacks with in-process recovery. SDK batching is automatic; source retention remains your responsibility."""
+"""Level 2: continuous Futures with in-process recovery. SDK batching is automatic; source retention remains your responsibility."""
 
 import os
 import time
@@ -61,8 +61,7 @@ MAX_RECOVERIES = 6
 def main():
     """Stream generated rows; pause on capacity, drain on interrupt, recover in process."""
     import signal
-    from concurrent.futures import Future
-    from queue import SimpleQueue, Empty
+
     total = int(os.environ.get("SNOWFLAKE_TEST_ROWS", "5000"))
     if total < 0:
         raise ValueError("SNOWFLAKE_TEST_ROWS must be nonnegative")
@@ -80,31 +79,14 @@ def main():
     deadline = time.monotonic() + STALL_SECONDS
     complete = False
     waiting_for_capacity = False
-    inbox = SimpleQueue()
-    def install_callbacks(channel, epoch):
-        # SDK handlers only enqueue; the main loop owns completion and recovery.
-        channel.set_success_handler(lambda detail: inbox.put((epoch, detail.append_tokens, None)))
-        channel.set_error_handler(lambda detail: inbox.put((epoch, detail.append_tokens, detail.error)))
+
     try:
         client = create_client()
         channel = client.get_elastic_channel()
-        install_callbacks(channel, generation)
+
         while next_id < total and not stopping or pending:
             try:
-                while True:
-                    try:
-                        epoch, tokens, failure = inbox.get_nowait()
-                    except Empty:
-                        break
-                    if epoch != generation:
-                        continue
-                    for token in tokens:
-                        acknowledgement = pending.get(token)
-                        if acknowledgement is not None and not acknowledgement.done():
-                            if failure is None:
-                                acknowledgement.set_result(None)
-                            else:
-                                acknowledgement.set_exception(failure)
+
                 # Observe outcomes without waiting for an entire submission window.
                 progress = False
                 for event_id, acknowledgement in list(pending.items()):
@@ -121,9 +103,7 @@ def main():
                 if next_id < total and not stopping and len(pending) < MAX_PENDING:
                     # Replace sample_row with a retained source read and row mapping.
                     event_id = next_id
-                    acknowledgement = Future()
-                    channel.append_row(sample_row(event_id), event_id)
-                    pending[event_id] = acknowledgement
+                    pending[event_id] = channel.append_row_with_wait(sample_row(event_id), None)
                     next_id += 1
                     waiting_for_capacity = False
                 else:
@@ -134,8 +114,7 @@ def main():
                     for event_id, acknowledgement in list(pending.items()):
                         if acknowledgement.done() and acknowledgement.exception() is error:
                             try:
-                                channel.append_row(sample_row(event_id), event_id)
-                                pending[event_id] = Future()
+                                pending[event_id] = channel.append_row_with_wait(sample_row(event_id), None)
                             except streaming.StreamingIngestError as retry:
                                 if retry.http_status_code != 429:
                                     raise
@@ -165,7 +144,7 @@ def main():
                 generation += 1
                 client = create_client()
                 channel = client.get_elastic_channel()
-                install_callbacks(channel, generation)
+
                 # Regenerate this sample's unresolved rows. A real source must retain them.
                 replay = list(pending)
                 pending.clear()
@@ -175,9 +154,7 @@ def main():
                         if time.monotonic() >= deadline:
                             raise TimeoutError("Recovery exceeded stalled-progress budget")
                         try:
-                            acknowledgement = Future()
-                            channel.append_row(sample_row(event_id), event_id)
-                            pending[event_id] = acknowledgement
+                            pending[event_id] = channel.append_row_with_wait(sample_row(event_id), None)
                             break
                         except streaming.StreamingIngestError as retry:
                             if retry.http_status_code != 429:

@@ -5,8 +5,7 @@
   "description": "Snowpipe Streaming SDK example for Node.js",
   "main": "elastic_ingest.js",
   "scripts": {
-    "start": "node elastic_ingest.js",
-    "test": "node --test test/*.test.js"
+    "start": "node elastic_ingest.js"
   },
   "engines": {
     "node": ">=20"

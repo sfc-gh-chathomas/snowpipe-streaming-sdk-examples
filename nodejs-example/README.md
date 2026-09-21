@@ -1,129 +1,54 @@
-# Node.js Snowpipe Streaming SDK Examples
+# Node.js Elastic Examples
 
-[`elastic_ingest.js`](./elastic_ingest.js) and
-[`elastic_ingest_callbacks.js`](./elastic_ingest_callbacks.js) tour the append
-APIs (Promises vs handlers). [`elastic_ingest_unbounded.js`](./elastic_ingest_unbounded.js)
-keeps that pipelined single-row pattern going for a large default row count.
-These examples require `snowpipe-streaming` **1.8.0 or later** and Node.js 20
-or later.
-
-## Examples
-
-| Path | File | What it adds |
-| --- | --- | --- |
-| Elastic ingest | [`elastic_ingest.js`](./elastic_ingest.js) | The four append APIs. Pipelined single-row `appendRowWithWait` is the recommended default; `appendRows` is optional. |
-| Elastic ingest (callbacks) | [`elastic_ingest_callbacks.js`](./elastic_ingest_callbacks.js) | Same tour with `appendRow` / `appendRows`. Handlers only enqueue; the ingest path waits. |
-| Elastic ingest (unbounded) | [`elastic_ingest_unbounded.js`](./elastic_ingest_unbounded.js) | Pipelined single-row appends at volume (10M rows by default). Ctrl+C drains accepted work and prints ack latency and rows/s. |
-
-## Setup
-
-### Requirements
-
-- Node.js 20 or later
-- npm
-- A Snowflake account with RSA key-pair authentication
-- A role allowed to insert into the target table
-
-Install the SDK:
-
-```bash
-npm install
-```
-
-### Target table
-
-```sql
-CREATE OR REPLACE TABLE MY_DATABASE.MY_SCHEMA.MY_TABLE (
-    DATA VARIANT,
-    EVENT_ID NUMBER,
-    C1 NUMBER,
-    C2 VARCHAR,
-    TS TIMESTAMP_NTZ
-);
-```
-
-No `CREATE PIPE` is required. Table-mode clients use the default
-`MY_TABLE-STREAMING` pipe.
-
-### Authentication
-
-Create `profile.json` from `profile.json.example`:
-
-```json
-{
-  "account": "<account_identifier>",
-  "user": "your_username",
-  "url": "https://<account_identifier>.snowflakecomputing.com:443",
-  "private_key_file": "rsa_key.p8",
-  "role": "your_role"
-}
-```
-
-Set object names through the environment or edit their example defaults:
-
-```bash
-export SNOWFLAKE_DATABASE=MY_DATABASE
-export SNOWFLAKE_SCHEMA=MY_SCHEMA
-export SNOWFLAKE_TABLE=MY_TABLE
-```
-
-Alternatively, set `SNOWFLAKE_PAT`, `SNOWFLAKE_ACCOUNT`, and `SNOWFLAKE_URL`.
-`SNOWFLAKE_ROLE` is optional. The examples pass these values through
-`connectionProperties()`.
+Node.js 20+ on an SDK-supported platform. SDK version: 1.8.0.
 
 ## Run
 
+From this directory:
+
 ```bash
-npm start
+npm install
+node elastic_ingest.js
+node elastic_ingest_continuous.js
 node elastic_ingest_callbacks.js
-node elastic_ingest_unbounded.js
 ```
 
-Set `SNOWFLAKE_TEST_ROWS` to change the generated row count in the unbounded
-example (default 10,000,000). Ctrl+C stops intake, waits for appends already
-accepted by the SDK, prints stats, and closes.
+## Choose a Level
 
-## Semantics
+| Level | Goal | Behavior |
+| --- | --- | --- |
+| 1: Quickstart | First successful ingest | Pipeline 10 single-row appends, observe acknowledgements, close. Fail fast on errors. |
+| 2: Continuous | Adapt a sustained producer | Futures/Promises, 1,000 outstanding appends, backpressure, limited client recreation, stop-and-drain. |
+| 3: Callbacks | Integrate with an event-driven app | Equivalent scope to Level 2; SDK handlers enqueue outcomes and the control loop owns recovery. |
 
-### Elastic Channels
+Callbacks are an alternative completion style, not stronger delivery guarantees. Every file is self-contained. The SDK batches transport; the application does not need to assemble batches for wire efficiency.
 
-An Elastic acknowledgement confirms that Snowflake durably accepted the
-append. It does not confirm row validity or immediate table visibility. Check
-the target table and its error table separately.
+## What You Must Adapt
 
-The SDK batches rows for transport. Waiting after every append is the slow
-path. Pipelined `appendRowWithWait` — submit many rows, then `await` the
-Promises — is the recommended default for throughput and simplicity.
-`appendRows` / `appendRowsWithWait` are optional: one Promise and one
-append token for a logical group when you already have a batch, or to cut
-JS/FFI call overhead. They do not replace SDK transport batching.
-Fire-and-forget `appendRow` / `appendRows` return no Promise; success and
-error handlers are the only acknowledgement signal, and they echo the
-caller-supplied append token. Those handlers run on the SDK acknowledgement
-callback: enqueue a cheap event and return. Do not wait, block the event
-loop, or call back into the SDK from a handler. Count on the ingest path
-after `waitOne()`.
+`sample_row` / `sampleRow` generates synthetic `EVENT_ID`, `C1`, and `C2` values. Replace it and the integer input loop with a retained source and your table mapping. `SNOWFLAKE_RUN_ID` prefixes `C2` to identify a run; it is a diagnostic marker, not a deduplication key. Successful output reports durable acknowledgements; check table materialization and error logging separately.
 
-Average ack latency can look large next to rows/s. Many appends are in
-flight, so throughput is not `1 / latency`.
+Levels 2/3 default to 5,000 rows. Set `SNOWFLAKE_TEST_ROWS` for another nonnegative count. Pending work is bounded to 1,000 events, not bytes; size this for your payloads. On backpressure the rejected event remains eligible for retry. Client recreation occurs only on structured invalidation, up to six times per run. Other terminal errors stop the program. Recreation may replay unresolved events and therefore introduce duplicates.
 
-Replaying an Elastic append can create a duplicate. Use stable source event IDs
-and define downstream reconciliation for your application.
+There is no short per-Future acknowledgement deadline. Levels 2/3 stop after 30 minutes without observed durable progress while work is pending, or sustained capacity rejection. Recovery and close calls retain their own SDK timeouts. A stop signal requests intake to stop and accepted work to drain; a stalled drain still fails at the operational deadline. SIGKILL and machine loss cannot drain.
 
-## Tests
+**This is not a durable source adapter.** Counters and pending data are in memory. Keep real events recoverable outside the SDK until confirmed. The sample regenerates unresolved rows by ID during in-process recovery; it does not persist checkpoints or automatically resume a previous process. Out-of-order acknowledgement counts are not a source offset. Define source acknowledgement, stable IDs, duplicate reconciliation, and restart semantics before deploying. The end-to-end retained-source/crash-recovery recipe is deferred to Level 4.
 
-The tests use SDK-shaped fake clients and do not connect to Snowflake:
+## Authentication and Target
 
-```bash
-npm test
+Use `profile.json` based on `profile.json.example` for key-pair authentication, or inject `SNOWFLAKE_PAT` with explicit `SNOWFLAKE_ACCOUNT` and `SNOWFLAKE_URL`. `SNOWFLAKE_ROLE` is optional. Use a secure credential manager and a least-privilege role. Set `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, and `SNOWFLAKE_TABLE` to an existing target:
+
+```sql
+CREATE TABLE MY_DATABASE.MY_SCHEMA.MY_TABLE (
+    EVENT_ID NUMBER,
+    C1 NUMBER,
+    C2 VARCHAR
+);
 ```
 
-They cover connection properties, callback handoff, and clean shutdown after
-interrupt.
+The table-mode SDK client uses the default streaming pipe. No manually created channel name is required for Elastic.
 
-## Additional Resources
+## Production Boundary
 
-- [Elastic Channels overview](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-elastic-channels-overview)
-- [Elastic Channels getting started](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-elastic-channels-getting-started)
-- [Elastic Channels best practices](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-elastic-channels-best-practices)
-- [Snowpipe Streaming SDK on npm](https://www.npmjs.com/package/snowpipe-streaming)
+Handle source capacity/overflow, durable retention, permanent row errors, and host failure in your application. Do not interpret SDK buffering as disk persistence or automatic exactly-once replay. Validate your real source, shutdown, and failure paths before production. No Kafka hop is required solely for delivering events to Snowflake.
+
+Legacy named-channel and monitoring examples remain separate from these Elastic levels.

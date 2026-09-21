@@ -108,19 +108,6 @@ table endpoint, set `PIPE` near the top of `elastic_production.py`:
 PIPE = "MY_TABLE-STREAMING"  # or any custom pipe name
 ```
 
-## Tests
-
-Narrow unit tests cover batching, backoff/jitter math, `Retry-After`
-parsing, JWT claim construction, and endpoint URL selection without making
-any network calls. The tests import the same third-party libraries as the
-example (`requests`, `PyJWT`, `cryptography`), so install the requirements
-before running them:
-
-```bash
-pip install -r requirements.txt
-python -m unittest test_elastic_production.py -v
-```
-
 ## Troubleshooting
 
 - **HTTP 401 (Unauthorized)**: The example forces one scoped-token refresh

@@ -1,115 +1,54 @@
-# Java Snowpipe Streaming SDK Examples
+# Java Elastic Examples
 
-`ElasticChannelIngest` and `ElasticChannelCallbacks` tour the append APIs
-(Futures vs handlers). `ElasticChannelUnbounded` keeps that pipelined
-single-row pattern going for a large default row count. These examples
-require `snowpipe-streaming` **1.8.0 or later**.
+JDK 11+ and Maven. SDK version: 1.8.0.
 
-## Examples
+## Run
 
-| Path | Class | What it adds |
+From this directory:
+
+```bash
+mvn compile
+mvn exec:java -Dexec.mainClass=com.snowflake.example.ElasticChannelIngest
+mvn exec:java -Dexec.mainClass=com.snowflake.example.ElasticChannelContinuous
+mvn exec:java -Dexec.mainClass=com.snowflake.example.ElasticChannelCallbacks
+```
+
+## Choose a Level
+
+| Level | Goal | Behavior |
 | --- | --- | --- |
-| Elastic ingest | `ElasticChannelIngest` | The four append APIs. Pipelined single-row `appendRowWithWait` is the recommended default; `appendRows` is optional. |
-| Elastic ingest (callbacks) | `ElasticChannelCallbacks` | Same tour with `appendRow` / `appendRows`. Handlers only enqueue; the ingest thread waits. |
-| Elastic ingest (unbounded) | `ElasticChannelUnbounded` | Pipelined single-row appends at volume (10M rows by default). Interrupt drains accepted work and prints ack latency and rows/s. |
+| 1: Quickstart | First successful ingest | Pipeline 10 single-row appends, observe acknowledgements, close. Fail fast on errors. |
+| 2: Continuous | Adapt a sustained producer | Futures/Promises, 1,000 outstanding appends, backpressure, limited client recreation, stop-and-drain. |
+| 3: Callbacks | Integrate with an event-driven app | Equivalent scope to Level 2; SDK handlers enqueue outcomes and the control loop owns recovery. |
 
-The `monitoring` directory contains separate monitoring and abort examples.
+Callbacks are an alternative completion style, not stronger delivery guarantees. Every file is self-contained. The SDK batches transport; the application does not need to assemble batches for wire efficiency.
 
-## Setup
+## What You Must Adapt
 
-### Requirements
+`sample_row` / `sampleRow` generates synthetic `EVENT_ID`, `C1`, and `C2` values. Replace it and the integer input loop with a retained source and your table mapping. `SNOWFLAKE_RUN_ID` prefixes `C2` to identify a run; it is a diagnostic marker, not a deduplication key. Successful output reports durable acknowledgements; check table materialization and error logging separately.
 
-- Java 11 or later
-- Maven 3.6 or later
-- A Snowflake account with RSA key-pair authentication
-- A role allowed to insert into the target table
+Levels 2/3 default to 5,000 rows. Set `SNOWFLAKE_TEST_ROWS` for another nonnegative count. Pending work is bounded to 1,000 events, not bytes; size this for your payloads. On backpressure the rejected event remains eligible for retry. Client recreation occurs only on structured invalidation, up to six times per run. Other terminal errors stop the program. Recreation may replay unresolved events and therefore introduce duplicates.
 
-### Target table
+There is no short per-Future acknowledgement deadline. Levels 2/3 stop after 30 minutes without observed durable progress while work is pending, or sustained capacity rejection. Recovery and close calls retain their own SDK timeouts. A stop signal requests intake to stop and accepted work to drain; a stalled drain still fails at the operational deadline. SIGKILL and machine loss cannot drain.
+
+**This is not a durable source adapter.** Counters and pending data are in memory. Keep real events recoverable outside the SDK until confirmed. The sample regenerates unresolved rows by ID during in-process recovery; it does not persist checkpoints or automatically resume a previous process. Out-of-order acknowledgement counts are not a source offset. Define source acknowledgement, stable IDs, duplicate reconciliation, and restart semantics before deploying. The end-to-end retained-source/crash-recovery recipe is deferred to Level 4.
+
+## Authentication and Target
+
+Use `profile.json` based on `profile.json.example` for key-pair authentication, or inject `SNOWFLAKE_PAT` with explicit `SNOWFLAKE_ACCOUNT` and `SNOWFLAKE_URL`. `SNOWFLAKE_ROLE` is optional. Use a secure credential manager and a least-privilege role. Set `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, and `SNOWFLAKE_TABLE` to an existing target:
 
 ```sql
-CREATE OR REPLACE TABLE MY_DATABASE.MY_SCHEMA.MY_TABLE (
-    DATA VARIANT,
+CREATE TABLE MY_DATABASE.MY_SCHEMA.MY_TABLE (
     EVENT_ID NUMBER,
     C1 NUMBER,
-    C2 VARCHAR,
-    TS TIMESTAMP_NTZ
+    C2 VARCHAR
 );
 ```
 
-No `CREATE PIPE` is required. Table-mode clients use the default
-`MY_TABLE-STREAMING` pipe.
+The table-mode SDK client uses the default streaming pipe. No manually created channel name is required for Elastic.
 
-### Authentication
+## Production Boundary
 
-Create `profile.json` from `profile.json.example`:
+Handle source capacity/overflow, durable retention, permanent row errors, and host failure in your application. Do not interpret SDK buffering as disk persistence or automatic exactly-once replay. Validate your real source, shutdown, and failure paths before production. No Kafka hop is required solely for delivering events to Snowflake.
 
-```json
-{
-  "account": "<account_identifier>",
-  "user": "your_username",
-  "url": "https://<account_identifier>.snowflakecomputing.com:443",
-  "private_key_file": "rsa_key.p8",
-  "role": "your_role"
-}
-```
-
-Set object names through the environment or edit their example defaults:
-
-```bash
-export SNOWFLAKE_DATABASE=MY_DATABASE
-export SNOWFLAKE_SCHEMA=MY_SCHEMA
-export SNOWFLAKE_TABLE=MY_TABLE
-```
-
-Alternatively, set `SNOWFLAKE_PAT`, `SNOWFLAKE_ACCOUNT`, and `SNOWFLAKE_URL`.
-`SNOWFLAKE_ROLE` is optional. The examples pass these values through
-`connectionProperties()`.
-
-## Build And Run
-
-```bash
-mvn clean package
-
-# ElasticChannelIngest is the default.
-mvn exec:java
-mvn exec:java -Dexec.mainClass=com.snowflake.example.ElasticChannelCallbacks
-mvn exec:java -Dexec.mainClass=com.snowflake.example.ElasticChannelUnbounded
-```
-
-Set `SNOWFLAKE_TEST_ROWS` to change the generated row count in the unbounded
-example (default 10,000,000). Interrupt the process to stop intake, wait for
-appends already accepted by the SDK, print stats, and close.
-
-## Semantics
-
-An Elastic acknowledgement confirms that Snowflake durably accepted the
-append. It does not confirm row validity or immediate table visibility. Check
-the target table and its error table separately.
-
-The SDK batches rows for transport. Waiting after every append is the slow
-path. Pipelined `appendRowWithWait` — submit many rows, then wait on the
-Futures — is the recommended default for throughput and simplicity.
-`appendRows` / `appendRowsWithWait` are optional: one Future and one
-append token for a logical group when you already have a batch, or to cut
-call overhead. They do not replace SDK transport batching.
-Fire-and-forget `appendRow` / `appendRows` return no Future; success and
-error handlers are the only acknowledgement signal, and they echo the
-caller-supplied append token. Those handlers run on the SDK acknowledgement
-thread: enqueue onto a `BlockingQueue` with `offer` and return. Do not wait,
-take locks the ingest thread also waits on, or call back into the SDK from a
-handler. `offer` on an unbounded queue never blocks; a bounded `put` can
-deadlock the ack thread. Count on the ingest thread after `poll`.
-
-Average ack latency can look large next to rows/s. Many appends are in
-flight, so throughput is not `1 / latency`.
-
-Replaying an Elastic append can create a duplicate. Use stable source event IDs
-and define downstream reconciliation for your application.
-
-## Tests
-
-The tests use SDK-shaped fake clients and do not connect to Snowflake:
-
-```bash
-mvn test
-```
+Legacy named-channel and monitoring examples remain separate from these Elastic levels.

@@ -1,35 +1,9 @@
-#!/usr/bin/env node
-/**
- * Elastic ingest: the four append APIs.
- *
- * Elastic Channels need no channel name, offset token, or recovery config.
- * Create a table-mode client, get the channel, and append.
- *
- * The SDK batches rows for transport. Waiting after every append is the slow
- * path. Pipelining single-row appendRowWithWait calls is the recommended
- * default for throughput and simplicity.
- *
- * appendRows is optional: one Promise and one append token for a logical group
- * when you already have a batch, or to cut JS/FFI call overhead. It does not
- * replace SDK transport batching.
- *
- * Fire-and-forget appendRow/appendRows return no Promise. Success and error
- * handlers are the only acknowledgement signal; pass your own append token and
- * the SDK echoes it back.
- */
 "use strict";
-
+// Level 1: pipelined first ingest. Sample rows are regenerable; SDK memory is not durable source storage.
 process.env.SS_LOG_LEVEL ??= "warn";
-
 const { randomUUID } = require("node:crypto");
 const streaming = require("snowpipe-streaming");
-
-const PIPELINE_ROWS = 10;
-const BATCH_COUNT = 2;
-const BATCH_SIZE = 5;
-const FIRE_AND_FORGET_ROWS = 3;
-const FIRE_AND_FORGET_BATCH_SIZE = 4;
-const ACK_TIMEOUT_MS = 60_000;
+const RUN_ID = process.env.SNOWFLAKE_RUN_ID || randomUUID();
 
 function connectionProperties() {
   const pat = process.env.SNOWFLAKE_PAT;
@@ -65,118 +39,33 @@ function sampleRow(eventId) {
   return {
     EVENT_ID: eventId,
     C1: eventId,
-    C2: `event-${eventId}`,
+    C2: `${RUN_ID}-${eventId}`,
   };
 }
 
+// Pipeline first, then confirm; do not wait after each row.
 async function main(clientFactory = createClient) {
   const client = await clientFactory();
+  const pending = [];
+  let complete = false;
   try {
-    // Elastic Channels belong to their client and are not closed separately.
     const channel = await client.getElasticChannel();
-    let nextId = 0;
-
-    // 1. Wait per row — simplest call, and the slow path.
-    await channel.appendRowWithWait(sampleRow(nextId), `event-${nextId}`);
-    nextId += 1;
-
-    // 2. Recommended: submit every row before waiting. The SDK batches
-    // these for transport.
-    const pipelined = [];
-    for (let eventId = nextId; eventId < nextId + PIPELINE_ROWS; eventId++) {
-      pipelined.push(channel.appendRowWithWait(sampleRow(eventId), null));
+    for (let eventId = 0; eventId < 10; eventId++) {
+      pending.push(channel.appendRowWithWait(sampleRow(eventId), null)
+        .then(() => null, (error) => error));
     }
-    await Promise.all(pipelined);
-    nextId += PIPELINE_ROWS;
-
-    // 3. Optional: application batches when you already have a group, or
-    // want fewer Promises and tokens. Same pipelining; not required for
-    // wire efficiency.
-    const batched = [];
-    for (let batchIndex = 0; batchIndex < BATCH_COUNT; batchIndex++) {
-      const rows = [];
-      for (let eventId = nextId; eventId < nextId + BATCH_SIZE; eventId++) {
-        rows.push(sampleRow(eventId));
-      }
-      batched.push(channel.appendRowsWithWait(rows, `batch-${batchIndex}`));
-      nextId += BATCH_SIZE;
-    }
-    await Promise.all(batched);
-
-    // 4. Fire-and-forget: no Promise. Handlers are the only ack signal.
-    // They run on the SDK ack callback — cheap bookkeeping only. The SDK
-    // echoes your append token; it does not assign an offset.
-    const submittedAt = new Map();
-    const latencies = [];
-    const failures = [];
-
-    channel.setSuccessHandler((detail) => {
-      const now = performance.now();
-      for (const token of detail.appendTokens) {
-        latencies.push(now - submittedAt.get(token));
-      }
-    });
-    channel.setErrorHandler((detail) => {
-      failures.push(detail);
-    });
-
-    const started = performance.now();
-    let callbackRows = 0;
-    for (let eventId = nextId; eventId < nextId + FIRE_AND_FORGET_ROWS; eventId++) {
-      const token = `event-${eventId}`;
-      submittedAt.set(token, performance.now());
-      channel.appendRow(sampleRow(eventId), token);
-    }
-    nextId += FIRE_AND_FORGET_ROWS;
-    callbackRows += FIRE_AND_FORGET_ROWS;
-
-    const fireAndForgetBatch = [];
-    for (let eventId = nextId; eventId < nextId + FIRE_AND_FORGET_BATCH_SIZE; eventId++) {
-      fireAndForgetBatch.push(sampleRow(eventId));
-    }
-    submittedAt.set("batch-ff", performance.now());
-    channel.appendRows(fireAndForgetBatch, "batch-ff");
-    nextId += FIRE_AND_FORGET_BATCH_SIZE;
-    callbackRows += FIRE_AND_FORGET_BATCH_SIZE;
-
-    await channel.waitForFlush({ timeoutMs: ACK_TIMEOUT_MS });
-    if (failures.length) {
-      throw failures[0].error;
-    }
-    const elapsedSec = (performance.now() - started) / 1000;
-
-    console.log(`Durably acknowledged ${nextId} rows`);
-    if (latencies.length && elapsedSec > 0) {
-      const avgAckMs = latencies.reduce((sum, value) => sum + value, 0) / latencies.length;
-      const rps = callbackRows / elapsedSec;
-      // Average ack latency can look large. Many appends are in flight, so
-      // throughput is not 1 / latency — parallelism carries the rate.
-      console.log(`Callback path: avg ack latency ${avgAckMs.toFixed(1)} ms, ${rps.toFixed(0)} rows/s`);
-    }
+    const errors = await Promise.all(pending);
+    if (errors.some(Boolean)) throw errors.find(Boolean);
+    complete = true;
+    console.log(`Durably acknowledged 10 rows; run=${RUN_ID}. Check materialization separately.`);
   } finally {
-    await client.close({ waitForFlush: true, timeoutMs: ACK_TIMEOUT_MS });
+    await client.close({ waitForFlush: complete, timeoutMs: 30_000 });
   }
 }
 
 if (require.main === module) {
-  const keepAlive = setInterval(() => {}, 1_000);
-  main()
-    .catch((error) => {
-      console.error(error.message);
-      process.exitCode = 1;
-    })
+  const keepAlive = setInterval(() => {}, 1000);
+  main().catch((error) => { console.error(error); process.exitCode = 1; })
     .finally(() => clearInterval(keepAlive));
 }
-
-module.exports = {
-  PIPELINE_ROWS,
-  BATCH_COUNT,
-  BATCH_SIZE,
-  FIRE_AND_FORGET_ROWS,
-  FIRE_AND_FORGET_BATCH_SIZE,
-  ACK_TIMEOUT_MS,
-  connectionProperties,
-  createClient,
-  sampleRow,
-  main,
-};
+module.exports = { main, createClient, sampleRow };

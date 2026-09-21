@@ -1,5 +1,5 @@
 "use strict";
-// Level 3: callback integration. Sample rows are regenerable; SDK memory is not durable source storage.
+// Level 2: continuous Promise ingestion. Sample rows are regenerable; SDK memory is not durable source storage.
 process.env.SS_LOG_LEVEL ??= "warn";
 const { randomUUID } = require("node:crypto");
 const streaming = require("snowpipe-streaming");
@@ -51,7 +51,10 @@ const pause = () => new Promise((resolve) => setTimeout(resolve, 250));
 // Observe outcomes immediately; never leave rejected Promises unhandled.
 function submit(channel, eventId) {
   const item = { done: false, error: null };
-  channel.appendRow(sampleRow(eventId), eventId);
+  channel.appendRowWithWait(sampleRow(eventId), null).then(
+    () => { item.done = true; },
+    (error) => { item.error = error; item.done = true; },
+  );
   return item;
 }
 
@@ -72,24 +75,14 @@ async function main(clientFactory = createClient) {
   let waitingForCapacity = false;
   let deadline = performance.now() + STALL_MS;
   const pending = new Map();
-  const inbox = [];
-  function install(channel, epoch) {
-    channel.setSuccessHandler((detail) => inbox.push({ epoch, tokens: detail.appendTokens }));
-    channel.setErrorHandler((detail) => inbox.push({ epoch, tokens: detail.appendTokens, error: detail.error }));
-  }
+
   try {
     client = await clientFactory();
     let channel = await client.getElasticChannel();
-    install(channel, generation);
+
     while ((!stopping && nextId < total) || pending.size) {
       try {
-        for (const outcome of inbox.splice(0)) {
-          if (outcome.epoch !== generation) continue;
-          for (const token of outcome.tokens) {
-            const item = pending.get(token);
-            if (item && !item.done) { item.done = true; item.error = outcome.error; }
-          }
-        }
+
         let progress = false;
         for (const [eventId, item] of pending) {
           if (!item.done) continue;
@@ -133,7 +126,7 @@ async function main(clientFactory = createClient) {
         generation++;
         client = await clientFactory();
         channel = await client.getElasticChannel();
-        install(channel, generation);
+
         console.warn(`Recreated client; replaying ${pending.size} unresolved events; duplicates possible`);
         for (const eventId of pending.keys()) {
           while (true) {

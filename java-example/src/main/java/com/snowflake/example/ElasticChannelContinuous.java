@@ -11,8 +11,8 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
-/** Level 3: callback integration. Source storage and process-crash replay are not provided. */
-public class ElasticChannelCallbacks {
+/** Level 2: continuous Futures. Source storage and process-crash replay are not provided. */
+public class ElasticChannelContinuous {
     static final String DATABASE = env("SNOWFLAKE_DATABASE", "MY_DATABASE");
     static final String SCHEMA = env("SNOWFLAKE_SCHEMA", "MY_SCHEMA");
     static final String TABLE = env("SNOWFLAKE_TABLE", "MY_TABLE");
@@ -27,20 +27,7 @@ public class ElasticChannelCallbacks {
                 .contains(error.getErrorCodeName());
     }
 
-    /** SDK handlers only enqueue immutable outcome records; main owns pending state. */
-    static final class Outcome {
-        final int generation;
-        final Iterable<Object> tokens;
-        final SFException error;
-        Outcome(int generation, Iterable<Object> tokens, SFException error) {
-            this.generation = generation; this.tokens = tokens; this.error = error;
-        }
-    }
-    static void install(SnowflakeStreamingIngestElasticChannel channel, int generation,
-                        Queue<Outcome> inbox) {
-        channel.setSuccessHandler(detail -> inbox.offer(new Outcome(generation, detail.getAppendTokens(), null)));
-        channel.setErrorHandler(detail -> inbox.offer(new Outcome(generation, detail.getAppendTokens(), detail.getError())));
-    }
+
 
     /** Append until capacity is reached, then collect outcomes; retain unresolved rows for recovery. */
     public static void main(String[] args) throws Exception {
@@ -64,23 +51,14 @@ public class ElasticChannelCallbacks {
         boolean complete = false;
         boolean waitingForCapacity = false;
         long deadline = System.nanoTime() + STALL_NANOS;
-        Queue<Outcome> inbox = new ConcurrentLinkedQueue<>();
+
         try {
             client = createClient();
             SnowflakeStreamingIngestElasticChannel channel = client.getElasticChannel();
-            install(channel, generation, inbox);
+
             while ((!stopping.get() && nextId < total) || !pending.isEmpty()) {
                 try {
-                    Outcome outcome;
-                    while ((outcome = inbox.poll()) != null) {
-                        if (outcome.generation != generation) continue;
-                        for (Object token : outcome.tokens) {
-                            CompletableFuture<Void> ack = pending.get((Integer) token);
-                            if (ack == null || ack.isDone()) continue;
-                            if (outcome.error == null) ack.complete(null);
-                            else ack.completeExceptionally(outcome.error);
-                        }
-                    }
+
                     boolean progress = false;
                     Iterator<Map.Entry<Integer, CompletableFuture<Void>>> entries = pending.entrySet().iterator();
                     while (entries.hasNext()) {
@@ -100,9 +78,7 @@ public class ElasticChannelCallbacks {
                     if (!stopping.get() && nextId < total && pending.size() < MAX_PENDING) {
                         int eventId = nextId;
                         // Replace the sample mapping with your retained source event.
-                        CompletableFuture<Void> acknowledgement = new CompletableFuture<>();
-                        channel.appendRow(sampleRow(eventId), eventId);
-                        pending.put(eventId, acknowledgement);
+                        pending.put(eventId, channel.appendRowWithWait(sampleRow(eventId), null));
                         nextId++;
                         waitingForCapacity = false;
                     } else {
@@ -117,8 +93,7 @@ public class ElasticChannelCallbacks {
                                 if (failed.getCause() != error) continue;
                                 int eventId = entry.getKey();
                                 try {
-                                    channel.appendRow(sampleRow(eventId), eventId);
-                                    entry.setValue(new CompletableFuture<>());
+                                    entry.setValue(channel.appendRowWithWait(sampleRow(eventId), null));
                                 } catch (SFException retry) {
                                     if (retry.getHttpStatusCode() != 429) throw retry;
                                 }
@@ -141,15 +116,13 @@ public class ElasticChannelCallbacks {
                     generation++;
                     client = createClient();
                     channel = client.getElasticChannel();
-                    install(channel, generation, inbox);
+
                     System.err.println("Recreated client; replaying " + pending.size() + " unresolved rows; duplicates possible");
                     for (int eventId : new ArrayList<>(pending.keySet())) {
                         while (true) {
                             if (System.nanoTime() >= deadline) throw new TimeoutException("Recovery exceeded stalled-progress budget");
                             try {
-                                CompletableFuture<Void> acknowledgement = new CompletableFuture<>();
-                                channel.appendRow(sampleRow(eventId), eventId);
-                                pending.put(eventId, acknowledgement);
+                                pending.put(eventId, channel.appendRowWithWait(sampleRow(eventId), null));
                                 break;
                             } catch (SFException retry) {
                                 if (retry.getHttpStatusCode() != 429) throw retry;

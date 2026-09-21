@@ -9,6 +9,16 @@ The Snowpipe Streaming SDK enables applications to stream data directly into Sno
 The language examples use **Elastic Channels**: one implicit, Snowflake-managed
 channel per pipe, with concurrent producers and durable acknowledgements.
 
+## Three Learning Levels
+
+1. **Quickstart:** ten pipelined single-row appends, acknowledgement, and cleanup.
+2. **Continuous ingestion:** bounded Futures/Promises, backpressure, in-process client recreation, and shutdown drain.
+3. **Callback integration:** the same operational scope using lightweight callback handoff. This is an alternative API style, not a stronger delivery guarantee.
+
+Each SDK file is self-contained. Start with Level 1, then adapt Level 2 for a realistic PoC.
+Retain events outside SDK memory until confirmed. Persistent source checkpoints and crash replay
+are not supplied; that advanced Level 4 recipe is deferred. See each language README for limits.
+
 ## Choosing SDK vs. REST
 
 - **SDK (Java, Python, Node.js)** — recommended for most applications. Higher throughput and simpler error handling than calling the REST API directly.
@@ -20,7 +30,7 @@ This repository contains complete, runnable examples in multiple languages:
 
 ### [Java Example](./java-example)
 A complete Maven project demonstrating the Snowpipe Streaming SDK in Java. Includes:
-- An append-API tour (Futures and callbacks) plus a high-volume unbounded ingest example
+- Quickstart, continuous Futures ingestion, and callback integration
 - Maven build configuration with all required dependencies
 - Full example code with proper error handling
 - Comprehensive setup instructions
@@ -29,7 +39,7 @@ A complete Maven project demonstrating the Snowpipe Streaming SDK in Java. Inclu
 
 ### [Python Example](./python-example)
 A complete Python project demonstrating the Snowpipe Streaming SDK in Python. Includes:
-- An append-API tour (Futures and callbacks) plus a high-volume unbounded ingest example
+- Quickstart, continuous Futures ingestion, and callback integration
 - Requirements file with all necessary packages
 - Clean, well-documented example code
 - Setup instructions with virtual environment
@@ -38,7 +48,7 @@ A complete Python project demonstrating the Snowpipe Streaming SDK in Python. In
 
 ### [Node.js Example](./nodejs-example)
 A complete Node.js project demonstrating the Snowpipe Streaming SDK in Node.js. Includes:
-- An append-API tour (Promises and callbacks) plus a high-volume unbounded ingest example
+- Quickstart, continuous Promise ingestion, and callback integration
 - npm package configuration with all required dependencies
 - Clean, well-documented example code
 - Setup instructions
@@ -50,7 +60,7 @@ A production-grade example that streams into an Elastic Channel using the Snowpi
 - Bounded, batched NDJSON append requests with gzip compression
 - Retry with capped exponential backoff and full jitter, honoring `Retry-After`
 - Stable event IDs and `requestId`/`retryCount` reuse for duplicate reconciliation
-- Graceful shutdown and narrow unit tests
+- Graceful shutdown
 
 ## Getting Started
 
