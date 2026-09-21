@@ -54,17 +54,9 @@ A complete Node.js project demonstrating the Snowpipe Streaming SDK in Node.js. 
 - Setup instructions
 - Sample configuration files
 
-### [Python REST Example](./python-rest-example)
-A production-grade example that streams into an Elastic Channel using the Snowpipe Streaming REST API directly, with no SDK dependency. Includes:
-- Key-pair JWT generation, ingest-host discovery, and scoped-token exchange with refresh
-- Bounded, batched NDJSON append requests with gzip compression
-- Retry with capped exponential backoff and full jitter, honoring `Retry-After`
-- Stable event IDs and `requestId`/`retryCount` reuse for duplicate reconciliation
-- Graceful shutdown
-
 ## Getting Started
 
-1. Choose your preferred language (Java, Python, or Node.js), or the REST example if you don't want an SDK dependency
+1. Choose your preferred language (Java, Python, or Node.js)
 2. Navigate to the respective example directory
 3. Follow the README instructions in that directory to:
    - Set up your Snowflake table and pipe
