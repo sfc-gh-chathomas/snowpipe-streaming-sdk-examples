@@ -57,6 +57,8 @@ public class NamedChannelQuickstart {
 
                 System.out.println("Client created successfully");
 
+                // A fresh name isolates this demo. Restart recovery needs stable ownership
+                // and the committed offset returned by openChannel, not another random name.
                 // Open a channel for data ingestion using try-with-resources
                 try (SnowflakeStreamingIngestChannel channel = client.openChannel(
                         "MY_CHANNEL_" + UUID.randomUUID(), "0").getChannel()) {
@@ -67,6 +69,7 @@ public class NamedChannelQuickstart {
                     // Ingest rows — column names must match the target table schema.
                     // The default pipe uses MATCH_BY_COLUMN_NAME to map fields.
                     for (int i = 1; i <= MAX_ROWS; i++) {
+                        // Offsets identify source positions, not automatic deduplication keys.
                         String rowId = String.valueOf(i);
                         Map<String, Object> row = Map.of(
                             "c1", i,
@@ -82,6 +85,7 @@ public class NamedChannelQuickstart {
                     // Wait for all rows to be committed using waitForCommit.
                     // The predicate receives the latest committed offset token
                     // (String) and should return true when satisfied.
+                    // Timeout does not cancel ingestion or prove failure. Do not blindly replay.
                     channel.waitForCommit(
                         token -> token != null && Long.parseLong(token) >= MAX_ROWS,
                         Duration.ofSeconds(30)

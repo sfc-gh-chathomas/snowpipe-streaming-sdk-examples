@@ -42,6 +42,8 @@ def main():
 
         print("Client created successfully")
 
+        # A fresh name isolates this demo run. Restart recovery needs stable ownership
+        # and the committed offset returned by open_channel, not a new random name.
         # Open a channel for data ingestion using context manager
         with client.open_channel(f"MY_CHANNEL_{uuid.uuid4()}")[0] as channel:
             print(f"Channel opened: {channel.channel_name}")
@@ -50,6 +52,7 @@ def main():
             # The default pipe uses MATCH_BY_COLUMN_NAME to map fields.
             print(f"Ingesting {MAX_ROWS} rows...")
             for i in range(1, MAX_ROWS + 1):
+                # Offsets identify source positions; they are not automatic deduplication keys.
                 row_id = str(i)
                 channel.append_row(
                     {
@@ -68,6 +71,7 @@ def main():
             def all_rows_committed(token):
                 return token is not None and int(token) >= MAX_ROWS
 
+            # Timeout does not cancel ingestion or prove failure. Do not blindly replay.
             channel.wait_for_commit(all_rows_committed, timeout_seconds=30)
 
             # Now that data has landed, check the channel status
