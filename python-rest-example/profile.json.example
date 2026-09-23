@@ -3,8 +3,5 @@
   "user": "MY_USER",
   "url": "https://MY_ACCOUNT.snowflakecomputing.com",
   "private_key_file": "rsa_key.p8",
-  "role": "MY_ROLE",
-  "database": "MY_DATABASE",
-  "schema": "MY_SCHEMA",
-  "table": "MY_TABLE"
+  "role": "MY_ROLE"
 }

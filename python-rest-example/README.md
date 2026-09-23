@@ -1,103 +1,62 @@
-# Elastic REST Examples
+# Elastic REST Quickstart
 
-Prefer the Snowpipe Streaming SDK where possible: it owns transport batching and retries.
-Use direct REST when an SDK is unsuitable. These two examples use the Elastic table endpoint,
-not named-channel offsets or continuation tokens.
-
-| Example | Purpose | What it handles |
-| --- | --- | --- |
-| `elastic_quickstart.sh` | First successful request using cURL and PAT | Host discovery, scoped-token exchange, two NDJSON rows, fail-fast HTTP handling |
-| `elastic_production.py` | Application integration using Python HTTP requests, no SDK | Key-pair JWT or PAT, scoped-token refresh, sequential gzip batches, retries, and drain |
+Use the SDK when possible; it owns transport batching and retries. This example
+shows those responsibilities explicitly for direct REST, without a streaming SDK.
 
 ## Setup
 
-Create a target table with `EVENT_ID NUMBER`, `C1 NUMBER`, and `C2 VARCHAR`.
-Use an existing database/schema and a role authorized to ingest. Set
-`SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, and `SNOWFLAKE_TABLE`.
+Requires Python 3.9+. Create `profile.json` using `profile.json.example`, with your
+account, user, role, account URL, and private key path. Register the matching public
+key on your Snowflake user. Keep profiles and keys out of version control. For an
+encrypted key, inject `PRIVATE_KEY_PASSPHRASE` through your credential manager.
 
-### 1. cURL Quickstart
-
-Requires bash, curl, jq, and uuidgen. Inject `SNOWFLAKE_PAT` through a credential manager.
-Set `SNOWFLAKE_URL` to the HTTPS account URL; optionally set `SNOWFLAKE_ROLE`.
-The PAT must be authorized for that account and role.
-
-```bash
-bash elastic_quickstart.sh
-```
-
-Expected output includes `Durably acknowledged 2 rows` and a run marker.
-The script does not print credentials or write them to files. Do not enable shell tracing.
-It uses a 30-second HTTP timeout and makes no automatic retries. A timeout is ambiguous:
-Snowflake may already have accepted the request. Do not assume rerunning provides deduplication.
-For controlled retries and stable request identity, use the application example.
-
-### 2. Python Application
-
-Requires Python 3.9+ and the dependencies below:
+Create a table with `C1 NUMBER` and `C2 VARCHAR`. Set `DATABASE`, `SCHEMA`, and
+`TABLE` at the top of `elastic_channel_quickstart.py`. Run from this directory:
 
 ```bash
 python -m pip install -r requirements.txt
-python elastic_production.py
+python elastic_channel_quickstart.py
 ```
 
-The default authentication path reads `profile.json` (or `SNOWFLAKE_PROFILE`) matching
-`profile.json.example`: account, user, private key file, optional role and account URL,
-and target objects. Register the public key on the Snowflake user first. An encrypted
-private key can use credential-manager injection into `PRIVATE_KEY_PASSPHRASE`.
+## Walkthrough
 
-For PAT authentication, inject `SNOWFLAKE_PAT` and set `SNOWFLAKE_ACCOUNT` and
-`SNOWFLAKE_URL`; no profile or private key is needed. `SNOWFLAKE_ROLE` is optional.
-Both authentication paths discover the ingest hostname and exchange for a scoped token.
-Never commit profiles or keys. Private connectivity requires DNS for the discovered host.
+1. Load the profile and generate ten sample rows with an explicit loop.
+2. Discover the ingestion host and exchange a signed JWT for a scoped token.
+3. Encode rows as NDJSON, bounded by 5,000 rows and 4,000,000 uncompressed bytes.
+4. Gzip each batch. Split at row boundaries if its exact compressed body exceeds
+   1,000,000 bytes, below the 4 MB service wire limit. Reject a single oversized row.
+5. Send one request at a time. Confirm it before advancing source progress.
+6. Send the final partial batch and close the HTTP session.
 
-The actual entry point generates 10,505 rows by default. `SNOWFLAKE_TEST_ROWS` changes
-the count; `SNOWFLAKE_RUN_ID` sets the `C2` run marker. IDs are deterministic within
-the sample run. Replace them with source-unique stable IDs in a real application.
-Successful output reports confirmed and submitted counts. SIGINT/SIGTERM stops intake
-and drains accepted work.
+The ten sample rows normally form one compressed request. For a real source, pass
+an iterator into `batch_rows` rather than collecting the entire source into a list.
+The one-second flush check runs between source reads; a blocking source requires
+its own idle-flush integration. Input limits do not bound total process memory.
 
-## Delivery and Bounds
+## Retries and Delivery
 
-- One thread sends one request at a time. Retries naturally pause source intake; no executors,
-  Futures, or background queues are required. The tradeoff is lower peak throughput than parallel requests.
-- The sample caps each exact gzip payload at **1,000,000 compressed bytes**, below the 4 MB
-  service wire limit. A candidate batch that exceeds the sample cap is split at row boundaries
-  and recompressed; no oversized request is sent. A single row that cannot fit is rejected.
-- Candidate batches have independent limits of 5,000 rows and 4,000,000 uncompressed bytes.
-  These bound input buffering, not total process memory: encoded rows and compression copies add overhead.
-  Highly compressible input need not reach the compressed cap before a memory/row bound triggers a flush.
-- Partial batches flush after one second checked between source reads, or at end-of-input/shutdown.
-  An idle or blocking live source needs its own periodic flush integration.
-- Source progress advances only after each sequential request succeeds. If a split batch partly
-  succeeds, confirmed counts include those successful requests; unconfirmed source events remain yours.
-- Each batch keeps the same `requestId` across retries and increments `retryCount`, including the
-  one permitted 401 refresh. This is correlation, not an exactly-once guarantee.
-- Retryable HTTP/network failures use bounded retries and jitter. Server `Retry-After` delays are
-  not shortened. If a requested delay exceeds the remaining 30-minute batch retry budget, the batch
-  fails rather than retrying prematurely. Individual HTTP requests time out after 30 seconds.
-- Token discovery/exchange failures stop the batch; they are not silently retried indefinitely.
-- HTTP 404 is retried for transient availability loss, assuming the endpoint and target have been
-  validated during setup. Retries do not fix incorrect identifiers or missing resources. A persistent
-  404 fails after the bounded retry budget; verify the endpoint and target before restarting.
-- Shutdown requests stop intake, not an active HTTP request or its retries. The current batch and
-  final partial batch finish under their retry budgets. This is not a hard process shutdown deadline.
-  A failed drain must not be interpreted as successful delivery or permission to delete source events.
+Retries reuse identical compressed bytes and `requestId`, incrementing `retryCount`.
+The sample handles connection errors, timeouts, and HTTP 404/408/429/500/502/503/504.
+HTTP 404 retries address transient availability loss, not incorrect target names.
+Validate the target during setup. Persistent failures stop after eight retries or
+the 30-minute batch budget, whichever is reached first. Requests time out at 30 seconds.
+Backoff uses jitter and respects `Retry-After` without shortening the requested delay.
+HTTP 401 triggers at most one token refresh; other permanent errors fail visibly.
+Token discovery/exchange failures stop the run.
 
-## Source Responsibility
+Request identity does not guarantee deduplication. Ambiguous responses and replay
+can duplicate rows. Keep source events recoverable until acknowledgement. Acknowledgement
+confirms durable buffering, not row validity or immediate table visibility. Verify
+table contents separately. This quickstart does not implement crash recovery or
+signal-driven draining. It is an Elastic example, not a named-channel offset example.
 
-Keep events recoverable outside this process until confirmed. Pending memory is not durable storage.
-Ambiguous responses and replay can produce duplicates. SDK/HTTP acknowledgements confirm durable
-buffering, not row validity or immediate table visibility. Verify table contents and error logging
-separately. Persistent source checkpoints, crash replay, and host-loss durability are not supplied.
+## Validation
 
-## Validation Scope
-
-Both actual entry points have been run against a test account using PAT authentication.
-The key-pair JWT flow has private construction tests but has not been live-tested in this validation.
-No test credentials, private harnesses, or test folders are included here.
+Private tests cover compressed bounds, row preservation, retries, and JWT construction.
+Live PAT-backed testing of prior versions does not validate this profile-only JWT path.
+No credentials or private test harnesses are included in this repository.
 
 ## References
 
-- [Elastic REST tutorial](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-elastic-channels-rest-getting-started)
-- [REST endpoint reference](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-rest-api)
+- [REST reference](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-high-performance-rest-api)
 - [Elastic limitations](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-elastic-channels-limitations)
