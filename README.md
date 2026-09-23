@@ -6,18 +6,13 @@ This repository contains examples demonstrating how to use the Snowpipe Streamin
 
 The Snowpipe Streaming SDK enables applications to stream data directly into Snowflake tables with low latency and high throughput. This repository provides practical examples to help you get started with the SDK quickly.
 
-The language examples use **Elastic Channels**: one implicit, Snowflake-managed
-channel per pipe, with concurrent producers and durable acknowledgements.
+Each language provides two self-contained quickstarts using `profile.json`:
 
-## Three Learning Levels
+- **Elastic channel:** ten pipelined appends, durable acknowledgements, and cleanup.
+- **Named channel:** ten appends with offsets, a final commit wait, and channel status.
 
-1. **Quickstart:** ten pipelined single-row appends, acknowledgement, and cleanup.
-2. **Continuous ingestion:** bounded Futures/Promises, backpressure, in-process client recreation, and shutdown drain.
-3. **Callback integration:** the same operational scope using lightweight callback handoff. This is an alternative API style, not a stronger delivery guarantee.
-
-Each SDK file is self-contained. Start with Level 1, then adapt Level 2 for a realistic PoC.
-Retain events outside SDK memory until confirmed. Persistent source checkpoints and crash replay
-are not supplied; that advanced Level 4 recipe is deferred. See each language README for limits.
+The SDK handles transport batching and retries. These examples demonstrate first ingestion,
+not durable source recovery. See each language README for setup and delivery semantics.
 
 ## Choosing SDK vs. REST
 
@@ -30,7 +25,7 @@ This repository contains complete, runnable examples in multiple languages:
 
 ### [Java Example](./java-example)
 A complete Maven project demonstrating the Snowpipe Streaming SDK in Java. Includes:
-- Quickstart, continuous Futures ingestion, and callback integration
+- Elastic and named channel quickstarts
 - Maven build configuration with all required dependencies
 - Full example code with proper error handling
 - Comprehensive setup instructions
@@ -39,7 +34,7 @@ A complete Maven project demonstrating the Snowpipe Streaming SDK in Java. Inclu
 
 ### [Python Example](./python-example)
 A complete Python project demonstrating the Snowpipe Streaming SDK in Python. Includes:
-- Quickstart, continuous Futures ingestion, and callback integration
+- Elastic and named channel quickstarts
 - Requirements file with all necessary packages
 - Clean, well-documented example code
 - Setup instructions with virtual environment
@@ -48,7 +43,7 @@ A complete Python project demonstrating the Snowpipe Streaming SDK in Python. In
 
 ### [Node.js Example](./nodejs-example)
 A complete Node.js project demonstrating the Snowpipe Streaming SDK in Node.js. Includes:
-- Quickstart, continuous Promise ingestion, and callback integration
+- Elastic and named channel quickstarts
 - npm package configuration with all required dependencies
 - Clean, well-documented example code
 - Setup instructions

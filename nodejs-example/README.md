@@ -1,54 +1,58 @@
-# Node.js Elastic Examples
+# Node.js Streaming Quickstarts
 
-Node.js 20+ on an SDK-supported platform. SDK version: 1.8.0.
+Two self-contained examples send ten rows using SDK 1.8.0: an Elastic channel
+quickstart and a named channel quickstart. Requires Node.js 20+.
 
-## Run
+## Setup
 
-From this directory:
+Create `profile.json` using `profile.json.example`. Configure your account, user,
+role, and private key for key-pair authentication. Register the matching public
+key on the Snowflake user. Keep credentials and local profiles out of version control.
+See [key-pair authentication](https://docs.snowflake.com/en/user-guide/key-pair-auth).
 
-```bash
-npm install
-node elastic_ingest.js
-node elastic_ingest_continuous.js
-node elastic_ingest_callbacks.js
-```
-
-## Choose a Level
-
-| Level | Goal | Behavior |
-| --- | --- | --- |
-| 1: Quickstart | First successful ingest | Pipeline 10 single-row appends, observe acknowledgements, close. Fail fast on errors. |
-| 2: Continuous | Adapt a sustained producer | Futures/Promises, 1,000 outstanding appends, backpressure, limited client recreation, stop-and-drain. |
-| 3: Callbacks | Integrate with an event-driven app | Equivalent scope to Level 2; SDK handlers enqueue outcomes and the control loop owns recovery. |
-
-Callbacks are an alternative completion style, not stronger delivery guarantees. Every file is self-contained. The SDK batches transport; the application does not need to assemble batches for wire efficiency.
-
-## What You Must Adapt
-
-`sample_row` / `sampleRow` generates synthetic `EVENT_ID`, `C1`, and `C2` values. Replace it and the integer input loop with a retained source and your table mapping. `SNOWFLAKE_RUN_ID` prefixes `C2` to identify a run; it is a diagnostic marker, not a deduplication key. Successful output reports durable acknowledgements; check table materialization and error logging separately.
-
-Levels 2/3 default to 5,000 rows. Set `SNOWFLAKE_TEST_ROWS` for another nonnegative count. Pending work is bounded to 1,000 events, not bytes; size this for your payloads. On backpressure the rejected event remains eligible for retry. Client recreation occurs only on structured invalidation, up to six times per run. Other terminal errors stop the program. Recreation may replay unresolved events and therefore introduce duplicates.
-
-There is no short per-Future acknowledgement deadline. Levels 2/3 stop after 30 minutes without observed durable progress while work is pending, or sustained capacity rejection. Recovery and close calls retain their own SDK timeouts. A stop signal requests intake to stop and accepted work to drain; a stalled drain still fails at the operational deadline. SIGKILL and machine loss cannot drain.
-
-**This is not a durable source adapter.** Counters and pending data are in memory. Keep real events recoverable outside the SDK until confirmed. The sample regenerates unresolved rows by ID during in-process recovery; it does not persist checkpoints or automatically resume a previous process. Out-of-order acknowledgement counts are not a source offset. Define source acknowledgement, stable IDs, duplicate reconciliation, and restart semantics before deploying. The end-to-end retained-source/crash-recovery recipe is deferred to Level 4.
-
-## Authentication and Target
-
-Use `profile.json` based on `profile.json.example` for key-pair authentication, or inject `SNOWFLAKE_PAT` with explicit `SNOWFLAKE_ACCOUNT` and `SNOWFLAKE_URL`. `SNOWFLAKE_ROLE` is optional. Use a secure credential manager and a least-privilege role. Set `SNOWFLAKE_DATABASE`, `SNOWFLAKE_SCHEMA`, and `SNOWFLAKE_TABLE` to an existing target:
+Create a table in an existing database/schema using an authorized role:
 
 ```sql
 CREATE TABLE MY_DATABASE.MY_SCHEMA.MY_TABLE (
-    EVENT_ID NUMBER,
     C1 NUMBER,
-    C2 VARCHAR
+    C2 VARCHAR,
+    TS TIMESTAMP_NTZ
 );
 ```
 
-The table-mode SDK client uses the default streaming pipe. No manually created channel name is required for Elastic.
+Set `DATABASE`, `SCHEMA`, and `TABLE` at the top of the example you want to run.
+Both examples use the default streaming pipe; no CREATE PIPE statement is needed.
+Run from this language directory so `profile.json` resolves correctly:
 
-## Production Boundary
+```bash
+npm install
+node elastic_channel_quickstart.js
+node named_channel_quickstart.js
+```
 
-Handle source capacity/overflow, durable retention, permanent row errors, and host failure in your application. Do not interpret SDK buffering as disk persistence or automatic exactly-once replay. Validate your real source, shutdown, and failure paths before production. No Kafka hop is required solely for delivering events to Snowflake.
+## Choose a Quickstart
 
-Legacy named-channel and monitoring examples remain separate from these Elastic levels.
+- **Elastic:** generates rows, submits them before waiting, observes durable
+  acknowledgements, and closes the client. The SDK batches and retries transport
+  operations. No application channel name or source offset is required.
+- **Named:** opens a fresh demonstration channel, appends rows with offsets,
+  waits for the final committed offset, reports channel status, and closes.
+  The timestamp field demonstrates an additional column mapping.
+
+## Errors and Delivery
+
+Failures surface to the caller and resources are closed. The Elastic example does
+not impose a short timeout on individual acknowledgements. Its 30-second close
+budget is a cleanup limit. The named example has a 30-second commit wait; expiration
+does not cancel ingestion or prove failure. Do not blindly replay after a timeout.
+
+Elastic acknowledgements confirm durable buffering, not immediate table visibility
+or successful materialization of every row. Check table contents and error logging.
+Elastic replay can duplicate data. Keep real source events recoverable until confirmed.
+
+The named quickstart uses a new channel name per run for a clean demonstration.
+It is not a restart-recovery or exactly-once source integration recipe. Production
+recovery requires stable channel ownership and source replay using the committed
+offset returned on reopen. Neither quickstart implements crash recovery.
+
+Advanced continuous ingestion and callback examples are deferred to a separate PR.

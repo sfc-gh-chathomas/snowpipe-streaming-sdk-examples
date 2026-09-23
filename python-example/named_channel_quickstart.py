@@ -17,7 +17,7 @@ os.environ["SS_LOG_LEVEL"] = "warn"
 from snowflake.ingest.streaming import StreamingIngestClient
 
 
-MAX_ROWS = 100_000
+MAX_ROWS = 10
 
 # Replace these with your Snowflake object names
 DATABASE = "MY_DATABASE"
@@ -59,9 +59,6 @@ def main():
                     },
                     row_id
                 )
-
-                if i % 10_000 == 0:
-                    print(f"Ingested {i} rows...")
 
             print("All rows submitted. Waiting for commit...")
 

@@ -25,10 +25,10 @@ import java.util.concurrent.ExecutionException;
  * open a channel. No CREATE PIPE DDL is required. The default pipe name
  * follows the convention: {@code <TABLE_NAME>-STREAMING}
  */
-public class StreamingIngestExample {
+public class NamedChannelQuickstart {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String PROFILE_PATH = "profile.json";
-    private static final int MAX_ROWS = 100_000;
+    private static final int MAX_ROWS = 10;
 
     // Replace these with your Snowflake object names
     private static final String DATABASE = "MY_DATABASE";
@@ -75,9 +75,6 @@ public class StreamingIngestExample {
                         );
                         channel.appendRow(row, rowId);
 
-                        if (i % 10_000 == 0) {
-                            System.out.println("Ingested " + i + " rows...");
-                        }
                     }
 
                     System.out.println("All rows submitted. Waiting for commit...");
@@ -112,4 +109,3 @@ public class StreamingIngestExample {
         }
     }
 }
-

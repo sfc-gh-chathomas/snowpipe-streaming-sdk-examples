@@ -13,7 +13,7 @@
 const crypto = require("node:crypto");
 const { createClient } = require("snowpipe-streaming");
 
-const MAX_ROWS = 100_000;
+const MAX_ROWS = 10;
 
 // Replace these with your Snowflake object names
 const DATABASE = "MY_DATABASE";
@@ -58,9 +58,6 @@ async function main() {
           rowId,
         );
 
-        if (i % 10_000 === 0) {
-          console.log(`Ingested ${i} rows...`);
-        }
       }
 
       console.log("All rows submitted. Waiting for commit...");

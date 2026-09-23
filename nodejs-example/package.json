@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "description": "Snowpipe Streaming SDK example for Node.js",
-  "main": "elastic_ingest.js",
+  "main": "elastic_channel_quickstart.js",
   "scripts": {
-    "start": "node elastic_ingest.js"
+    "start": "node elastic_channel_quickstart.js",
+    "start:named": "node named_channel_quickstart.js"
   },
   "engines": {
     "node": ">=20"
