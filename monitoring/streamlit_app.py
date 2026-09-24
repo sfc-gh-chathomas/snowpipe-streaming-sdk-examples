@@ -49,16 +49,16 @@ def make_scope(source, database, schema, table, range_name, channel='', now=None
 
 
 def _where(scope):
-    clause = """FROM IDENTIFIER(%s)
+    clause = """FROM IDENTIFIER(?)
 WHERE RECORD_TYPE = 'EVENT'
   AND SCOPE['name']::STRING = 'snow.snowpipe.streaming'
-  AND RESOURCE_ATTRIBUTES['snow.database.name']::STRING = %s
-  AND RESOURCE_ATTRIBUTES['snow.schema.name']::STRING = %s
-  AND RESOURCE_ATTRIBUTES['snow.table.name']::STRING = %s
-  AND TIMESTAMP >= %s AND TIMESTAMP < %s"""
+  AND RESOURCE_ATTRIBUTES['snow.database.name']::STRING = ?
+  AND RESOURCE_ATTRIBUTES['snow.schema.name']::STRING = ?
+  AND RESOURCE_ATTRIBUTES['snow.table.name']::STRING = ?
+  AND TIMESTAMP >= ? AND TIMESTAMP < ?"""
     params = [scope.source, scope.database, scope.schema, scope.table, scope.start, scope.end]
     if scope.channel:
-        clause += "\n  AND VALUE['channel_name']::STRING = %s"
+        clause += "\n  AND VALUE['channel_name']::STRING = ?"
         params.append(scope.channel)
     return clause, params
 
@@ -77,7 +77,7 @@ def queries(scope, include_messages=False):
   APPROX_PERCENTILE(IFF(RECORD['name']::STRING = 'latency', VALUE['total_latency_ms']::NUMBER, NULL), 0.95) AS p95_latency_ms,
   MAX(TIMESTAMP) AS latest_event
 """ + where
-    volume = """SELECT TIME_SLICE(TIMESTAMP::TIMESTAMP_NTZ, %s, 'SECOND') AS bucket,
+    volume = """SELECT TIME_SLICE(TIMESTAMP::TIMESTAMP_NTZ, ?, 'SECOND') AS bucket,
   SUM(VALUE['row_count']::NUMBER) AS rows_ingested,
   SUM(VALUE['rows_parsed']::NUMBER) AS rows_parsed,
   SUM(VALUE['error_count']::NUMBER) AS errors
@@ -86,7 +86,7 @@ def queries(scope, include_messages=False):
   SUM(VALUE['row_count']::NUMBER) AS rows_ingested,
   SUM(VALUE['error_count']::NUMBER) AS errors
 """ + where + "\n  AND RECORD['name']::STRING = 'commit'\nGROUP BY 1 ORDER BY rows_ingested DESC LIMIT 20"
-    lifecycle = """SELECT TIME_SLICE(TIMESTAMP::TIMESTAMP_NTZ, %s, 'SECOND') AS bucket,
+    lifecycle = """SELECT TIME_SLICE(TIMESTAMP::TIMESTAMP_NTZ, ?, 'SECOND') AS bucket,
   COUNT_IF(VALUE['event_type']::STRING = 'OPEN') AS opens,
   COUNT_IF(VALUE['event_type']::STRING = 'DROP') AS drops
 """ + where + "\n  AND RECORD['name']::STRING = 'channel_lifecycle'\nGROUP BY 1 ORDER BY 1"
