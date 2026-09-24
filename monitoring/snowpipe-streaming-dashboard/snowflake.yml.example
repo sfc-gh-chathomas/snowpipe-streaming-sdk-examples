@@ -1,0 +1,20 @@
+definition_version: 2
+entities:
+  monitoring_dashboard:
+    type: streamlit
+    identifier:
+      name: SNOWPIPE_STREAMING_MONITORING_EXAMPLE
+      database: <app_database>
+      schema: <app_schema>
+    title: Snowpipe Streaming monitoring
+    query_warehouse: <query_warehouse>
+    runtime_name: SYSTEM$ST_CONTAINER_RUNTIME_PY3_11
+    compute_pool: <compute_pool>
+    external_access_integrations:
+      - <approved_package_integration>
+    main_file: streamlit_app.py
+    artifacts:
+      - streamlit_app.py
+      - monitoring.py
+      - preview_data.py
+      - pyproject.toml

@@ -33,6 +33,9 @@ A complete Node.js project demonstrating the Snowpipe Streaming SDK in Node.js. 
 - Setup instructions
 - Sample configuration files
 
+### [Monitoring Dashboard](./monitoring/snowpipe-streaming-dashboard)
+A Streamlit example for Snowpipe Streaming event-table telemetry. Includes scoped row/error and latency metrics, channel activity, an offline synthetic preview, and tests. Hosted use requires container runtime and restricted caller's rights; see the example's deployment and validation checklist.
+
 ## Getting Started
 
 1. Choose your preferred language (Java, Python, or Node.js)
