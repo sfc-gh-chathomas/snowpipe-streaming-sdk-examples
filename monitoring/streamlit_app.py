@@ -149,9 +149,9 @@ st.set_page_config(page_title='Snowpipe Streaming monitoring', layout='wide')
 st.title('Snowpipe Streaming monitoring')
 
 try:
-    connection = st.connection('snowflake-callers-rights')
+    connection = st.connection('snowflake')
 except Exception as error:
-    st.error('Connection unavailable. Use a container runtime with restricted caller rights and administrator-configured caller grants. See README. No owner-rights fallback is used.')
+    st.error('Connection unavailable. Check the Streamlit runtime and execution-role configuration. See README.')
     st.caption(safe_diagnostic(error, 'connection'))
     st.stop()
 
@@ -188,7 +188,7 @@ try:
             results[name] = frame
 except Exception as error:
     results.clear()
-    st.error('Telemetry could not be loaded. Check the source view, viewer permissions and caller grants, warehouse availability, and time range. No partial totals are displayed. Ask an administrator to inspect query history; raw database errors are not shown here.')
+    st.error('Telemetry could not be loaded. Check the source view, app execution-role permissions, warehouse availability, and time range. No partial totals are displayed. Ask an administrator to inspect query history; raw database errors are not shown here.')
     st.caption(safe_diagnostic(error, query_stage))
     st.stop()
 

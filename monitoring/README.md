@@ -7,7 +7,7 @@ Create a Streamlit in Snowflake app to monitor ingestion from your event table. 
 You need only **`streamlit_app.py` and `pyproject.toml`**. The CLI template is optional.
 
 1. Confirm that event collection is enabled for your ingestion target with `LOG_EVENT_LEVEL = INFO`. Snowflake provides a default event table; this app reads its `SNOWFLAKE.TELEMETRY.EVENTS_VIEW` view unless you choose another source. See [Monitor Snowpipe Streaming](https://docs.snowflake.com/en/user-guide/snowpipe-streaming/snowpipe-streaming-event-table-telemetry).
-2. Have your administrator configure viewer permissions and the app owner's [restricted caller grants](https://docs.snowflake.com/en/developer-guide/streamlit/features/restricted-callers-rights) for the event source and required resources. `SNOWFLAKE.EVENTS_VIEWER` gives access to the default view, not the base table. Caller grants and underlying viewer privileges are both required.
+2. Use an app execution role with permission to query the event source and use the required compute resources. `SNOWFLAKE.EVENTS_VIEWER` gives access to the default view, not a custom event table. For shared deployments, use a dedicated least-privilege owner role, not `ACCOUNTADMIN`.
 3. In Snowsight, create a Streamlit app using **Run on container**, select a compute pool and query warehouse, and use Streamlit **1.53.1 or later** with Python 3.11.
 4. Upload `streamlit_app.py` and `pyproject.toml`. Configure an approved package source as described in [Dependency management](https://docs.snowflake.com/en/developer-guide/streamlit/app-development/dependency-management).
 5. Run the app. Enter the target database, schema, and table names exactly as stored in Snowflake, choose a time range, and select **Load / refresh**. No event data is queried before submission.
@@ -18,9 +18,9 @@ With Snowflake CLI 3.14 or later, copy `snowflake.yml.example` to `snowflake.yml
 
 ## Access and sharing
 
-The app queries with the viewer's restricted caller rights, not the app owner's privileges. It has no owner-rights fallback and uses no shared result cache. The viewer's default role applies, which can differ from the role selected in Snowsight. This example is intended for Streamlit in Snowflake, not a publicly hosted local server.
+The app uses the standard `st.connection("snowflake")` connection. Deployed apps query with [owner's rights](https://docs.snowflake.com/en/developer-guide/streamlit/object-management/owners-rights), not each viewer's table privileges. No caller grants are required by this connection. Queries disable result caching. This example is intended for Streamlit in Snowflake, not a publicly hosted local server.
 
-Filters are not security controls. Restrict access with grants or a governed event view before sharing the app. Error messages are hidden by default because they can contain customer data; names and error codes can also be sensitive. Verify access with two differently privileged viewers before sharing broadly.
+Sharing the app can expose telemetry that viewers cannot query directly. Because viewers can change the source and target filters, grant the app owner access only to telemetry every intended viewer may see, preferably through a dedicated governed view. Filters and the hidden-by-default error-message option are not security controls. Do not share an `ACCOUNTADMIN`-owned app. Keep privileged Workspace tests private and verify the intended visibility before deployment.
 
 ## Interpreting the dashboard
 
