@@ -132,13 +132,27 @@ def collection_state(summary):
     return None
 
 
+def safe_diagnostic(error, stage):
+    fields = [f'Stage: {stage}']
+    for label, value, pattern in (
+        ('Type', type(error).__name__, r'[A-Za-z_][A-Za-z0-9_]{0,79}'),
+        ('Code', str(getattr(error, 'errno', '')), r'\d{1,10}'),
+        ('SQLSTATE', str(getattr(error, 'sqlstate', '')), r'[A-Z0-9]{5}'),
+        ('Query ID', str(getattr(error, 'sfqid', '')), r'[a-fA-F0-9-]{36}'),
+    ):
+        if re.fullmatch(pattern, value):
+            fields.append(f'{label}: {value}')
+    return ' | '.join(fields)
+
+
 st.set_page_config(page_title='Snowpipe Streaming monitoring', layout='wide')
 st.title('Snowpipe Streaming monitoring')
 
 try:
     connection = st.connection('snowflake-callers-rights')
-except Exception:
+except Exception as error:
     st.error('Connection unavailable. Use a container runtime with restricted caller rights and administrator-configured caller grants. See README. No owner-rights fallback is used.')
+    st.caption(safe_diagnostic(error, 'connection'))
     st.stop()
 
 with st.sidebar.form('scope'):
@@ -164,15 +178,18 @@ except ValueError as error:
     st.stop()
 
 results = {}
+query_stage = 'initialization'
 try:
     with st.spinner('Loading telemetry'):
         for name, (sql, params) in queries(scope, include_messages).items():
+            query_stage = name
             frame = connection.query(sql, params=params, ttl=0, timeout=30)
             frame.columns = [column.lower() for column in frame.columns]
             results[name] = frame
-except Exception:
+except Exception as error:
     results.clear()
     st.error('Telemetry could not be loaded. Check the source view, viewer permissions and caller grants, warehouse availability, and time range. No partial totals are displayed. Ask an administrator to inspect query history; raw database errors are not shown here.')
+    st.caption(safe_diagnostic(error, query_stage))
     st.stop()
 
 summary = results['summary'].iloc[0].to_dict() if not results['summary'].empty else {}
