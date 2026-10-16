@@ -36,6 +36,10 @@ A complete Node.js project demonstrating the Snowpipe Streaming SDK in Node.js. 
 ### [Monitoring Dashboard](./monitoring)
 A single-file Streamlit example for Snowpipe Streaming event-table telemetry. Upload the app and dependency file to a container-runtime Streamlit app; see the README for setup and required access.
 
+### [Demos](./demos)
+End-to-end, presentable demos. Includes:
+- **[Elastic Fleet](./demos/elastic-fleet-demo)** — 250 independent Python SDK clients streaming into one table through Elastic channels, with a live Snowflake App Runtime dashboard and a presenter runbook
+
 ## Getting Started
 
 1. Choose your preferred language (Java, Python, or Node.js)

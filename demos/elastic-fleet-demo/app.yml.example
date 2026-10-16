@@ -1,0 +1,70 @@
+version: 2
+
+# Copy to app.yml and replace every <PLACEHOLDER> before `snow app deploy` (see README).
+name: ELASTIC_FLEET_DEMO
+database: <DATABASE>            # where the app service object is created, e.g. ELASTIC_DEMO_DB
+schema: <SCHEMA>                # e.g. FLEET
+query_warehouse: <WAREHOUSE>    # e.g. ELASTIC_DEMO_WH
+
+# Build-time egress for `npm ci` only (registry.npmjs.org, cdn.npmjs.com). Created in sql/setup.sql.
+build_eai: <NPM_BUILD_EAI>      # e.g. ELASTIC_DEMO_NPM_EAI
+
+label: "Elastic Fleet Telemetry"
+description: "Live router telemetry streamed through a Snowpipe Streaming Elastic Channel, queried from Snowflake."
+icon: "public/icon.svg"
+
+# One instance; suspend after 2 hours without traffic (it wakes on the next visit).
+min_instances: 1
+max_instances: 1
+auto_suspend_secs: 7200
+
+# Table the dashboard reads and warehouse it queries with. Must match sql/setup.sql.
+environment_variables:
+  - name: ELASTIC_DEMO_DATABASE
+    value: "<DATABASE>"
+  - name: ELASTIC_DEMO_SCHEMA
+    value: "<SCHEMA>"
+  - name: ELASTIC_DEMO_TABLE
+    value: "ROUTER_TELEMETRY"
+  - name: ELASTIC_DEMO_WAREHOUSE
+    value: "<WAREHOUSE>"
+
+# Only the read-only dashboard is deployed. The Python producer runs on the
+# presenter's laptop and is never uploaded. examples/ is kept because the
+# code drawer serves examples/minimal_elastic.py.
+ignore:
+  - node_modules
+  - .env*
+  - __pycache__
+  - "*.pyc"
+  - .next
+  - .git
+  - snowflake.log
+  - .venv
+  - .pytest_cache
+  - producer
+  - tests
+  - scripts
+  - sql
+  - output
+  - "*.p8"
+  - "*.pem"
+  - "*.key"
+  - app.yml.builder
+  - app.yml.example
+
+install:
+  commands:
+    - ["npm", "ci", "--include=dev"]
+
+build:
+  commands:
+    - ["npm", "run", "build"]
+    # For standalone mode
+    - ["cp", "-r", ".next/static", ".next/standalone/.next/static"]
+    - ["cp", "-r", "public", ".next/standalone/public"]
+    # Avoid packaging extra node_modules since standalone includes its own
+    - ["rm", "-rf", "node_modules"]
+
+run:
+  command: ["node", ".next/standalone/server.js"]
