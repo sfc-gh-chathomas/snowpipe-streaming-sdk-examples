@@ -1,0 +1,20 @@
+node_modules/
+.next/
+out/
+output/
+*.tsbuildinfo
+.env.local
+*.log
+.DS_Store
+.venv/
+__pycache__/
+.pytest_cache/
+*.p8
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+# Your filled-in deployment manifest (copy from app.yml.example)
+app.yml
+.snowflake/
